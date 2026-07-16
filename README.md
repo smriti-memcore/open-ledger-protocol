@@ -1,5 +1,9 @@
 # Open Ledger Protocol (OLP) Reference Implementation
 
+<p align="center">
+  <img src="olp_logo.jpg" alt="Open Ledger Protocol Logo" width="250" />
+</p>
+
 This repository contains the official reference implementation of the **Open Ledger Protocol (OLP) Version 1.0.0-draft**.
 
 OLP is an open, developer-centric financial accounting specification that abstracts standard double-entry bookkeeping rules out of application database layers. It acts like an "HTTP header" standard for commerce events: by attaching context headers (such as role, product type, recognition model, tax jurisdiction, and LOB segment), raw billing/order events are compiled into GAAP/IFRS-compliant, balanced journal entries dynamically.
