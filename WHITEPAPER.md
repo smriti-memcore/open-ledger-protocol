@@ -19,7 +19,7 @@ INSERT INTO transactions (order_id, user_id, amount) VALUES ('ord_123', 'usr_456
 ```
 While sufficient for initial operations, this format lacks audit compliance at scale. Under modern accounting frameworks (such as US GAAP and IFRS), a single payment receipt of $100.00 is rarely recorded as flat revenue. Instead:
 1. If the item is physical: Revenue is recognized **point-in-time** upon delivery, but cash is held in deferred accounts or clearing accounts until carrier confirmation.
-2. If the item is a subscription: Revenue is deferred and recognized **over-time** (amortized ratably) over the contract term (e.g. \( \$8.33 \) per month for 12 months).
+2. If the item is a subscription: Revenue is deferred and recognized **over-time** (amortized ratably) over the contract term (e.g. $8.33 per month for 12 months).
 3. If merchant processing fees are subtracted: Cash received is logged net, with the fee debited to processing expenses.
 4. If sales taxes (VAT) are collected: The tax portion must be isolated and credited to a liability account matching the client's local tax jurisdiction (e.g. Germany vs. US).
 
@@ -52,30 +52,30 @@ By decoupling account paths, OLP relies on standard headers to dictate ledger ro
 
 OLP runs double-entry arithmetic in **minor currency units (integers)** to eliminate IEEE 754 floating-point rounding errors. For any compiled transaction, the sum of debits must exactly equal the sum of credits:
 
-\[\sum \text{Debits} = \sum \text{Credits}\]
+$$\sum \text{Debits} = \sum \text{Credits}$$
 
 ### 3.1 Proportional Coupon/Discount Allocations
 Under ASC 606 Step 3, transaction-level discounts must be allocated proportionally across line items based on relative selling prices before revenue rules execute.
 
-For a transaction with total price \(P_{total}\), discount \(D\), and line item price \(p_i\), the allocated discount \(d_i\) is:
+For a transaction with total price $P_{\text{total}}$, discount $D$, and line item price $p_i$, the allocated discount $d_i$ is:
 
-\[d_i = \left\lfloor \frac{D \times p_i}{P_{total}} \right\rfloor\]
+$$d_i = \left\lfloor \frac{D \times p_i}{P_{\text{total}}} \right\rfloor$$
 
 Any remaining rounding remainder is swept into the final line item:
 
-\[d_{last} = D - \sum_{i=1}^{n-1} d_i\]
+$$d_{\text{last}} = D - \sum_{i=1}^{n-1} d_i$$
 
 ### 3.2 Sales Returns Reserves
-For merchants anticipating returns, recognizing 100% of revenue is prohibited (ASC 606-10-55-22). If expected return rate is \(R\) basis points (where \(1 \text{ bps} = 0.01\%\)):
+For merchants anticipating returns, recognizing 100% of revenue is prohibited (ASC 606-10-55-22). If expected return rate is $R$ basis points (where $1 \text{ bps} = 0.01\%$):
 
 *   **Refund Liability (Reserve)**:
-    \[\text{Refund Reserve} = \left\lfloor \frac{\text{Base Price} \times R}{10000} \right\rfloor\]
+    $$\text{Refund Reserve} = \left\lfloor \frac{\text{Base Price} \times R}{10000} \right\rfloor$$
 *   **Net Revenue Recognized**:
-    \[\text{Net Revenue} = \text{Base Price} - \text{Refund Reserve}\]
+    $$\text{Net Revenue} = \text{Base Price} - \text{Refund Reserve}$$
 *   **Right to Recover Returned Assets**:
-    \[\text{Right to Recover Asset} = \left\lfloor \frac{\text{COGS Estimate} \times R}{10000} \right\rfloor\]
+    $$\text{Right to Recover Asset} = \left\lfloor \frac{\text{COGS Estimate} \times R}{10000} \right\rfloor$$
 *   **Net Cost of Goods Sold**:
-    \[\text{Net COGS} = \text{COGS Estimate} - \text{Right to Recover}\]
+    $$\text{Net COGS} = \text{COGS Estimate} - \text{Right to Recover}$$
 
 Ledger entries:
 ```text
