@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  📄 <b><a href="SPECIFICATION.md">Read the Specification (v1.0.0-draft) &rarr;</a></b> &middot; <b><a href="CPA_AUDIT_REVIEW.md">CPA Audit Review &rarr;</a></b>
+  📄 <b><a href="SPECIFICATION.md">Read the Specification (v1.0.0-draft) &rarr;</a></b> &middot; <b><a href="WHITEPAPER.md">Read the Whitepaper &rarr;</a></b>
 </p>
 
 This repository contains the official reference implementation of the **Open Ledger Protocol (OLP) Version 1.0.0-draft**.
