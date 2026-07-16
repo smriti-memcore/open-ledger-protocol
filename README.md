@@ -4,6 +4,16 @@
   <img src="olp_logo.jpg" alt="Open Ledger Protocol Logo" width="250" />
 </p>
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-61a009" alt="License" /></a>
+  <img src="https://img.shields.io/badge/compliance%20tests-passing-4ba600" alt="Compliance Tests" />
+  <img src="https://img.shields.io/badge/pypi%20package-package%20or%20version%20not%20found-d8412e" alt="PyPI Package" />
+</p>
+
+<p align="center">
+  📄 <b><a href="SPECIFICATION.md">Read the Specification (v1.0.0-draft) &rarr;</a></b> &middot; <b><a href="CPA_AUDIT_REVIEW.md">CPA Audit Review &rarr;</a></b>
+</p>
+
 This repository contains the official reference implementation of the **Open Ledger Protocol (OLP) Version 1.0.0-draft**.
 
 OLP is an open, developer-centric financial accounting specification that abstracts standard double-entry bookkeeping rules out of application database layers. It acts like an "HTTP header" standard for commerce events: by attaching context headers (such as role, product type, recognition model, tax jurisdiction, and LOB segment), raw billing/order events are compiled into GAAP/IFRS-compliant, balanced journal entries dynamically.
