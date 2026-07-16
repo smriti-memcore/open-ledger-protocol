@@ -529,15 +529,7 @@ class TestOLPEngine(unittest.TestCase):
         self.assertEqual(debits_us["/assets/receivables/intercompany_acme_de"], 8500)
         self.assertEqual(credits_us[ACCOUNT_PATHS["Intercompany Revenue"]], 8500)
 
-    # =========================================================================
-    # DIVISIONAL SEGMENT & COA OVERRIDE TESTS (PHASE 7)
-    # =========================================================================
-
     def test_operating_segment_and_consolidation_elimination(self):
-        """
-        ASC 280 / ASC 810: AWS bills Twitch internally.
-        Resulting ledger transactions must be marked as 'elimination' to avoid double-counting.
-        """
         event = OLPEvent(
             event_id="evt_internal_aws_bill",
             idempotency_key="idemp_internal_123",
@@ -550,8 +542,8 @@ class TestOLPEngine(unittest.TestCase):
             intercompany_transfer_amount=50000,
             accounting_context=AccountingContext(
                 entity_id="aws_corp",
-                segment_id="aws", # Segmenting
-                is_intercompany=True, # Elimination trigger
+                segment_id="aws",
+                is_intercompany=True,
                 role="principal",
                 product_type="digital_download",
                 recognition="point_in_time"
@@ -565,19 +557,15 @@ class TestOLPEngine(unittest.TestCase):
         self.assertTrue(tx_primary.is_balanced())
         self.assertTrue(tx_ic.is_balanced())
         
-        # Verify consolidation tag is elimination on both ledgers
         self.assertEqual(tx_primary.consolidation_type, "elimination")
         self.assertEqual(tx_ic.consolidation_type, "elimination")
 
     def test_dynamic_chart_of_accounts_overrides(self):
-        """
-        Audible overrides the 'Subscription Revenue' path.
-        """
         event = OLPEvent(
             event_id="evt_audible_sub",
             idempotency_key="idemp_audible_998",
             timestamp="2026-07-16T12:00:00Z",
-            amount=1500, # $15.00
+            amount=1500,
             currency="USD",
             description="Audible Monthly Subscription",
             customer_id="cust_listener",
@@ -595,7 +583,6 @@ class TestOLPEngine(unittest.TestCase):
         )
         result = OLPEngine.compile_event(event)
         
-        # Check amortization schedule records override path
         self.assertEqual(len(result.amortization_schedule), 1)
         amort_tx = result.amortization_schedule[0]
         self.assertTrue(amort_tx.is_balanced())
@@ -603,6 +590,190 @@ class TestOLPEngine(unittest.TestCase):
         credits = {e.account: e.amount for e in amort_tx.entries if e.type == "credit"}
         self.assertIn("/equity/revenue/audio_subscriptions", credits)
         self.assertEqual(credits["/equity/revenue/audio_subscriptions"], 1500)
+
+    # =========================================================================
+    # ADVANCED RETAIL COMMERCE TESTS (PHASE 8)
+    # =========================================================================
+
+    def test_line_item_context_overrides_bundle(self):
+        """
+        ASC 606 Step 4 Bundle: Kindle Device ($100.00 / 10000c, point_in_time)
+        + Audible Subscription ($50.00 / 5000c, 5-month over_time).
+        Taxes and processing fees must be allocated proportionally.
+        """
+        device_ctx = AccountingContext(
+            role="principal",
+            product_type="physical",
+            recognition="point_in_time"
+        )
+        sub_ctx = AccountingContext(
+            role="principal",
+            product_type="digital_saas",
+            recognition="over_time",
+            term_months=5
+        )
+        
+        event = OLPEvent(
+            event_id="evt_bundle_pos",
+            idempotency_key="idemp_bundle_pos",
+            timestamp="2026-07-16T12:00:00Z",
+            amount=16500, # $150.00 price + $15.00 sales tax
+            tax_amount=1500,
+            processing_fee=450, # $4.50 card processor fee
+            currency="USD",
+            description="Kindle + Subscription Bundle Checkout",
+            customer_id="cust_reader",
+            accounting_context=device_ctx, # Default global context
+            line_items=[
+                LineItem(item_id="kindle_device", price=10000, cogs_estimate=3000), # uses default physical point-in-time
+                LineItem(item_id="kindle_unlimited_sub", price=5000, accounting_context=sub_ctx) # overrides with over-time SaaS
+            ]
+        )
+        
+        result = OLPEngine.compile_event(event)
+        init_tx = result.initial_transaction
+        self.assertTrue(init_tx.is_balanced())
+        
+        debits = {e.account: e.amount for e in init_tx.entries if e.type == "debit"}
+        credits = {e.account: e.amount for e in init_tx.entries if e.type == "credit"}
+        
+        # Verify split of cash and processing fee:
+        # Cash total debited = 16500 - 450 = 16050
+        self.assertEqual(debits[ACCOUNT_PATHS["Cash"]], 16050)
+        self.assertEqual(debits[ACCOUNT_PATHS["Payment Processing Expense"]], 450)
+        
+        # Verify splits of revenue:
+        # Device immediate recognized: $100.00
+        self.assertEqual(credits[ACCOUNT_PATHS["Gross Revenue"]], 10000)
+        # Sub deferred: $50.00
+        self.assertEqual(credits[ACCOUNT_PATHS["Deferred Revenue"]], 5000)
+        
+        # Verify splits of COGS:
+        # Device immediate COGS: $30.00
+        self.assertEqual(debits[ACCOUNT_PATHS["Cost of Goods Sold"]], 3000)
+
+        # Verify Sub Amortization schedule (5 months at $10.00 each)
+        self.assertEqual(len(result.amortization_schedule), 5)
+        for tx in result.amortization_schedule:
+            self.assertTrue(tx.is_balanced())
+            debs = {e.account: e.amount for e in tx.entries if e.type == "debit"}
+            creds = {e.account: e.amount for e in tx.entries if e.type == "credit"}
+            self.assertEqual(debs[ACCOUNT_PATHS["Deferred Revenue"]], 1000)
+            self.assertEqual(creds[ACCOUNT_PATHS["Subscription Revenue"]], 1000)
+
+    def test_sales_returns_reserves(self):
+        """
+        ASC 606 expected returns reserve: 3% return rate expected (300 bps)
+        Gross item price = $100.00 (10000 cents). COGS = $40.00 (4000 cents).
+        Gross Revenue = $97.00. Refund Reserve = $3.00.
+        Net COGS = $38.80 (3880 cents). Right to Recover = $1.20 (120 cents).
+        """
+        event = OLPEvent(
+            event_id="evt_reserve_pos",
+            idempotency_key="idemp_reserve_pos",
+            timestamp="2026-07-16T12:00:00Z",
+            amount=10000,
+            currency="USD",
+            description="Book sale with expected 3% returns reserve",
+            customer_id="cust_student",
+            expected_return_rate_basis_points=300, # 3.00% expected returns
+            accounting_context=AccountingContext(
+                role="principal",
+                product_type="physical",
+                recognition="point_in_time"
+            ),
+            line_items=[
+                LineItem(item_id="hardcover_textbook", price=10000, cogs_estimate=4000)
+            ]
+        )
+        result = OLPEngine.compile_event(event)
+        tx = result.initial_transaction
+        self.assertTrue(tx.is_balanced())
+        
+        debits = {e.account: e.amount for e in tx.entries if e.type == "debit"}
+        credits = {e.account: e.amount for e in tx.entries if e.type == "credit"}
+        
+        self.assertEqual(credits[ACCOUNT_PATHS["Gross Revenue"]], 9700)
+        self.assertEqual(credits[ACCOUNT_PATHS["Refund Reserve"]], 300)
+        
+        self.assertEqual(debits[ACCOUNT_PATHS["Cost of Goods Sold"]], 3880)
+        self.assertEqual(debits[ACCOUNT_PATHS["Right to Recover"]], 120)
+        self.assertEqual(credits[ACCOUNT_PATHS["Inventory"]], 4000)
+
+    def test_gift_card_lifecycle(self):
+        ctx = AccountingContext(
+            role="principal",
+            product_type="digital_download",
+            recognition="point_in_time"
+        )
+        
+        # 1. Purchase $100 Gift card with a $3.00 fee
+        buy_event = OLPEvent(
+            event_id="gc_buy_1",
+            idempotency_key="idemp_gc_buy_1",
+            event_type="gift_card_purchased",
+            timestamp="2026-07-16T12:00:00Z",
+            amount=10000,
+            currency="USD",
+            description="Buy $100 store gift card",
+            customer_id="cust_gifting",
+            processing_fee=300,
+            accounting_context=ctx
+        )
+        res_buy = OLPEngine.compile_event(buy_event)
+        tx_buy = res_buy.initial_transaction
+        self.assertTrue(tx_buy.is_balanced())
+        
+        debits_b = {e.account: e.amount for e in tx_buy.entries if e.type == "debit"}
+        credits_b = {e.account: e.amount for e in tx_buy.entries if e.type == "credit"}
+        
+        self.assertEqual(debits_b[ACCOUNT_PATHS["Cash"]], 9700)
+        self.assertEqual(debits_b[ACCOUNT_PATHS["Payment Processing Expense"]], 300)
+        self.assertEqual(credits_b[ACCOUNT_PATHS["Gift Card Liability"]], 10000)
+
+        # 2. Redeem $40 of the Gift Card
+        redeem_event = OLPEvent(
+            event_id="gc_red_1",
+            idempotency_key="idemp_gc_red_1",
+            event_type="gift_card_redeemed",
+            timestamp="2026-07-20T12:00:00Z",
+            amount=4000,
+            currency="USD",
+            description="Redeem $40 gift card balance on books",
+            customer_id="cust_gifting",
+            accounting_context=ctx
+        )
+        res_red = OLPEngine.compile_event(redeem_event)
+        tx_red = res_red.initial_transaction
+        self.assertTrue(tx_red.is_balanced())
+        
+        debits_r = {e.account: e.amount for e in tx_red.entries if e.type == "debit"}
+        credits_r = {e.account: e.amount for e in tx_red.entries if e.type == "credit"}
+        
+        self.assertEqual(debits_r[ACCOUNT_PATHS["Gift Card Liability"]], 4000)
+        self.assertEqual(credits_r[ACCOUNT_PATHS["Gross Revenue"]], 4000)
+
+        # 3. Recognize $10 of unredeemed gift card breakage
+        breakage_event = OLPEvent(
+            event_id="gc_brk_1",
+            idempotency_key="idemp_gc_brk_1",
+            event_type="gift_card_breakage_recognized",
+            timestamp="2026-07-30T12:00:00Z",
+            amount=1000,
+            currency="USD",
+            description="Recognize $10 gift card expiration breakage",
+            customer_id="cust_gifting",
+            accounting_context=ctx
+        )
+        res_brk = OLPEngine.compile_event(breakage_event)
+        tx_brk = res_brk.initial_transaction
+        self.assertTrue(tx_brk.is_balanced())
+        
+        debits_brk = {e.account: e.amount for e in tx_brk.entries if e.type == "debit"}
+        credits_brk = {e.account: e.amount for e in tx_brk.entries if e.type == "credit"}
+        
+        self.assertEqual(debits_brk[ACCOUNT_PATHS["Gift Card Liability"]], 1000)
+        self.assertEqual(credits_brk[ACCOUNT_PATHS["Gift Card Breakage"]], 1000)
 
     def test_validation_errors(self):
         with self.assertRaises(ValueError):

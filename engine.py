@@ -22,6 +22,7 @@ class LineItem:
     item_id: str
     price: int                      # In cents
     cogs_estimate: int = 0          # In cents
+    accounting_context: Optional[AccountingContext] = None # Line-level overrides (ASC 606 Bundles)
 
 @dataclass
 class OLPEvent:
@@ -40,6 +41,7 @@ class OLPEvent:
     discount_amount: int = 0        # In cents
     capitalized_costs: int = 0      # In cents
     functional_amount: Optional[int] = None
+    expected_return_rate_basis_points: int = 0 # expected returns reserve rate (ASC 606, e.g. 300 = 3%)
     intercompany_entity_id: Optional[str] = None # Partner entity fulfilling order (ASC 810)
     intercompany_transfer_amount: int = 0        # Transfer pricing fee in cents
     line_items: List[LineItem] = field(default_factory=list)
@@ -79,6 +81,7 @@ ACCOUNT_PATHS = {
     "Contract Assets": "/assets/receivables/contract_assets",
     "Order Clearing": "/assets/receivables/order_clearing",
     "Payment Clearing": "/assets/receivables/payment_clearing",
+    "Right to Recover": "/assets/receivables/right_to_recover",
     "Inventory": "/assets/inventory",
     "Deferred Contract Costs": "/assets/deferred_costs/commissions",
     "Deferred Revenue": "/liabilities/deferred/revenue",
@@ -87,10 +90,13 @@ ACCOUNT_PATHS = {
     "Accounts Payable (Vendor)": "/liabilities/payables/vendor",
     "Sales Tax Payable": "/liabilities/tax/payable",
     "Commissions Payable": "/liabilities/payables/commissions",
+    "Refund Reserve": "/liabilities/refund_reserve",
+    "Gift Card Liability": "/liabilities/gift_card",
     "Gross Revenue": "/equity/revenue/gross",
     "Subscription Revenue": "/equity/revenue/subscription",
     "Commission Revenue": "/equity/revenue/commission",
     "Intercompany Revenue": "/equity/revenue/intercompany",
+    "Gift Card Breakage": "/equity/revenue/breakage",
     "Refunds & Allowances": "/equity/revenue/refunds_allowances",
     "Gain on FX": "/equity/gain_fx",
     "Payment Processing Expense": "/expenses/processing/fees",
@@ -126,7 +132,8 @@ class OLPEngine:
             new_items.append(LineItem(
                 item_id=item.item_id,
                 price=new_price,
-                cogs_estimate=item.cogs_estimate
+                cogs_estimate=item.cogs_estimate,
+                accounting_context=item.accounting_context
             ))
             
         event.line_items = new_items
@@ -134,9 +141,6 @@ class OLPEngine:
 
     @staticmethod
     def _get_account_path(event: OLPEvent, default_key: str) -> str:
-        """
-        Supports dynamic COA overrides on a per-brand / per-segment basis.
-        """
         ctx = event.accounting_context
         if ctx.coa_overrides and default_key in ctx.coa_overrides:
             return ctx.coa_overrides[default_key]
@@ -144,41 +148,55 @@ class OLPEngine:
 
     @staticmethod
     def _get_tax_account(event: OLPEvent) -> str:
-        """
-        Dynamically route local tax credits for MNC jurisdictions.
-        """
         if event.tax_jurisdiction:
             clean_jurisdiction = event.tax_jurisdiction.lower().replace("-", "_")
             return f"/liabilities/tax/payable/{clean_jurisdiction}"
         return OLPEngine._get_account_path(event, "Sales Tax Payable")
 
     @staticmethod
+    def _get_debit_asset_account(event: OLPEvent) -> str:
+        ctx = event.accounting_context
+        if ctx.payment_method == "invoice":
+            if ctx.billing_status == "unbilled":
+                return OLPEngine._get_account_path(event, "Contract Assets")
+            return OLPEngine._get_account_path(event, "Accounts Receivable")
+        return OLPEngine._get_account_path(event, "Cash")
+
+    @staticmethod
     def compile_event(event: OLPEvent) -> CompilationResult:
         event = OLPEngine._allocate_discounts(event)
         ctx = event.accounting_context
-        
-        # Validation checks
-        if ctx.recognition == "over_time" and (ctx.term_months is None or ctx.term_months < 1):
+
+        # Check validation rules
+        if ctx.recognition == "over_time" and (ctx.term_months is None or ctx.term_months <= 0):
             raise ValueError("term_months must be >= 1 for over_time recognition")
-        
-        if ctx.role not in ("principal", "agent"):
-            raise ValueError(f"Unknown role: {ctx.role}")
-            
-        if ctx.product_type not in ("physical", "digital_saas", "digital_download"):
-            raise ValueError(f"Unknown product_type: {ctx.product_type}")
+        for item in event.line_items:
+            if item.accounting_context and item.accounting_context.recognition == "over_time" and (item.accounting_context.term_months is None or item.accounting_context.term_months <= 0):
+                raise ValueError("term_months must be >= 1 for line item over_time recognition")
 
-        if ctx.recognition not in ("point_in_time", "over_time"):
-            raise ValueError(f"Unknown recognition timing: {ctx.recognition}")
+        # Check for Line-Item level overrides (ASC 606 bundles)
+        has_line_overrides = any(item.accounting_context is not None for item in event.line_items)
+        if has_line_overrides and event.event_type not in (
+            "payment_settled", "refund_issued", "goods_returned", 
+            "contract_billed", "invoice_written_off", "gift_card_purchased",
+            "gift_card_redeemed", "gift_card_breakage_recognized"
+        ):
+            return OLPEngine._compile_split_bundle(event)
 
-        # Compute total COGS
-        total_cogs = sum(item.cogs_estimate for item in event.line_items)
-
-        # Route lifecycle & decoupled pipeline events
-        if event.event_type == "payment_settled":
+        # Route standard event types
+        if event.event_type == "gift_card_purchased":
+            return OLPEngine._compile_gift_card_purchased(event)
+        elif event.event_type == "gift_card_redeemed":
+            return OLPEngine._compile_gift_card_redeemed(event)
+        elif event.event_type == "gift_card_breakage_recognized":
+            return OLPEngine._compile_gift_card_breakage(event)
+        elif event.event_type == "payment_settled":
             res = OLPEngine._compile_payment_settled(event)
         elif event.event_type == "refund_issued":
             res = OLPEngine._compile_refund_issued(event)
         elif event.event_type == "goods_returned":
+            # total_cogs
+            total_cogs = sum(item.cogs_estimate for item in event.line_items)
             res = OLPEngine._compile_goods_returned(event, total_cogs)
         elif event.event_type == "contract_billed":
             res = OLPEngine._compile_contract_billed(event)
@@ -191,6 +209,7 @@ class OLPEngine:
         elif event.event_type == "payout_cleared":
             res = OLPEngine._compile_payout_cleared(event)
         elif ctx.role == "principal":
+            total_cogs = sum(item.cogs_estimate for item in event.line_items)
             if ctx.recognition == "point_in_time":
                 res = OLPEngine._compile_principal_pit(event, total_cogs)
             else:
@@ -227,7 +246,7 @@ class OLPEngine:
             )
             res.intercompany_transaction = partner_tx
 
-        # Set consolidation tags (ASC 810 Consolidation Eliminations)
+        # Set consolidation tags
         if ctx.is_intercompany:
             res.initial_transaction.consolidation_type = "elimination"
             if res.amortization_schedule:
@@ -237,6 +256,175 @@ class OLPEngine:
                 res.intercompany_transaction.consolidation_type = "elimination"
 
         return res
+
+    @staticmethod
+    def _compile_split_bundle(event: OLPEvent) -> CompilationResult:
+        """
+        ASC 606 Step 4: Multi-element bundle allocation compilation.
+        Converts the single event into localized line-item events, compiles each, and aggregates.
+        """
+        total_price = sum(item.price for item in event.line_items)
+        if total_price <= 0:
+            raise ValueError("Total bundle price must be > 0")
+
+        consolidated_entries = []
+        amort_by_date = {}
+        
+        accum_tax = 0
+        accum_fee = 0
+        n_items = len(event.line_items)
+
+        for idx, item in enumerate(event.line_items):
+            # Proportional splits of tax and fee
+            if idx == n_items - 1:
+                item_tax = event.tax_amount - accum_tax
+                item_fee = event.processing_fee - accum_fee
+            else:
+                item_tax = (event.tax_amount * item.price) // total_price
+                item_fee = (event.processing_fee * item.price) // total_price
+                accum_tax += item_tax
+                accum_fee += item_fee
+
+            # Context resolution: localized override falls back to global context
+            item_ctx = item.accounting_context if item.accounting_context is not None else event.accounting_context
+            
+            # Form mini-event payload
+            item_without_override = LineItem(
+                item_id=item.item_id,
+                price=item.price,
+                cogs_estimate=item.cogs_estimate,
+                accounting_context=None
+            )
+            item_event = OLPEvent(
+                event_id=event.event_id,
+                timestamp=event.timestamp,
+                amount=item.price + item_tax,
+                currency=event.currency,
+                description=f"Bundle Item: {item.item_id}",
+                customer_id=event.customer_id,
+                accounting_context=item_ctx,
+                idempotency_key=event.idempotency_key,
+                event_type=event.event_type,
+                tax_amount=item_tax,
+                tax_jurisdiction=event.tax_jurisdiction,
+                processing_fee=item_fee,
+                discount_amount=0,
+                expected_return_rate_basis_points=event.expected_return_rate_basis_points,
+                line_items=[item_without_override]
+            )
+
+            # Compile mini-event
+            item_res = OLPEngine.compile_event(item_event)
+            
+            # Merge initial transaction entries
+            consolidated_entries.extend(item_res.initial_transaction.entries)
+
+            # Merge monthly amortization entries
+            for amort_tx in item_res.amortization_schedule:
+                d = amort_tx.date
+                if d not in amort_by_date:
+                    amort_by_date[d] = []
+                amort_by_date[d].extend(amort_tx.entries)
+
+        # Net consolidated entries by (account, type)
+        netted_entries = {}
+        for entry in consolidated_entries:
+            key = (entry.account, entry.type)
+            netted_entries[key] = netted_entries.get(key, 0) + entry.amount
+        consolidated_entries = [LedgerEntry(account=k[0], type=k[1], amount=v) for k, v in netted_entries.items()]
+
+        # 1. Build Consolidated Initial Transaction
+        init_tx = Transaction(
+            transaction_id=f"tx_bundle_init_{uuid.uuid4().hex[:8]}",
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            description=f"OLP Bundle Initial booking: {event.description}",
+            status="posted",
+            consolidation_type="elimination" if event.accounting_context.is_intercompany else "standard",
+            entries=consolidated_entries
+        )
+
+        # 2. Build Consolidated Amortization Schedule
+        amort_schedule = []
+        for index, d in enumerate(sorted(amort_by_date.keys()), 1):
+            netted_amort = {}
+            for entry in amort_by_date[d]:
+                key = (entry.account, entry.type)
+                netted_amort[key] = netted_amort.get(key, 0) + entry.amount
+            amort_entries = [LedgerEntry(account=k[0], type=k[1], amount=v) for k, v in netted_amort.items()]
+            tx_amort = Transaction(
+                transaction_id=f"tx_bundle_amort_{index}_{uuid.uuid4().hex[:8]}",
+                source_event_id=event.event_id,
+                idempotency_key=event.idempotency_key,
+                date=d,
+                description=f"OLP Bundle Amortization Month {index}: {event.description}",
+                status="posted",
+                consolidation_type="elimination" if event.accounting_context.is_intercompany else "standard",
+                entries=amort_entries
+            )
+            amort_schedule.append(tx_amort)
+
+        return CompilationResult(initial_transaction=init_tx, amortization_schedule=amort_schedule)
+
+    @staticmethod
+    def _compile_gift_card_purchased(event: OLPEvent) -> CompilationResult:
+        tx_id = f"tx_gc_buy_{uuid.uuid4().hex[:8]}"
+        debit_cash = event.amount - event.processing_fee
+        
+        entries = [
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Cash"), type="debit", amount=debit_cash),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Gift Card Liability"), type="credit", amount=event.amount)
+        ]
+        if event.processing_fee > 0:
+            entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Processing Expense"), type="debit", amount=event.processing_fee))
+
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            description=f"OLP Gift Card Purchased: {event.description}",
+            status="posted",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
+
+    @staticmethod
+    def _compile_gift_card_redeemed(event: OLPEvent) -> CompilationResult:
+        tx_id = f"tx_gc_red_{uuid.uuid4().hex[:8]}"
+        entries = [
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Gift Card Liability"), type="debit", amount=event.amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Gross Revenue"), type="credit", amount=event.amount)
+        ]
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            description=f"OLP Gift Card Redeemed: {event.description}",
+            status="posted",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
+
+    @staticmethod
+    def _compile_gift_card_breakage(event: OLPEvent) -> CompilationResult:
+        tx_id = f"tx_gc_brk_{uuid.uuid4().hex[:8]}"
+        entries = [
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Gift Card Liability"), type="debit", amount=event.amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Gift Card Breakage"), type="credit", amount=event.amount)
+        ]
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            description=f"OLP Gift Card Breakage Recognized: {event.description}",
+            status="posted",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
 
     @staticmethod
     def _compile_order_placed(event: OLPEvent) -> CompilationResult:
@@ -412,15 +600,6 @@ class OLPEngine:
         return CompilationResult(initial_transaction=tx)
 
     @staticmethod
-    def _get_debit_asset_account(event: OLPEvent) -> str:
-        ctx = event.accounting_context
-        if ctx.payment_method == "invoice":
-            if ctx.billing_status == "unbilled":
-                return OLPEngine._get_account_path(event, "Contract Assets")
-            return OLPEngine._get_account_path(event, "Accounts Receivable")
-        return OLPEngine._get_account_path(event, "Cash")
-
-    @staticmethod
     def _compile_principal_pit(event: OLPEvent, total_cogs: float) -> CompilationResult:
         """
         Rule A: Principal + Physical/Digital + Point-in-Time (In Cents)
@@ -455,16 +634,38 @@ class OLPEngine:
             
         else: # immediate_sale
             debit_cash = event.amount - event.processing_fee if debit_account == OLPEngine._get_account_path(event, "Cash") else event.amount
-            entries = [
-                LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
-                LedgerEntry(account=OLPEngine._get_account_path(event, "Gross Revenue"), type="credit", amount=base_amount),
-                LedgerEntry(account=tax_acct, type="credit", amount=event.tax_amount)
-            ]
+            
+            # Apply Sales Returns Reserve split if expected returns rate > 0
+            if event.expected_return_rate_basis_points > 0:
+                refund_reserve = (base_amount * event.expected_return_rate_basis_points) // 10000
+                net_revenue = base_amount - refund_reserve
+                
+                entries = [
+                    LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
+                    LedgerEntry(account=OLPEngine._get_account_path(event, "Gross Revenue"), type="credit", amount=net_revenue),
+                    LedgerEntry(account=OLPEngine._get_account_path(event, "Refund Reserve"), type="credit", amount=refund_reserve),
+                    LedgerEntry(account=tax_acct, type="credit", amount=event.tax_amount)
+                ]
+            else:
+                entries = [
+                    LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
+                    LedgerEntry(account=OLPEngine._get_account_path(event, "Gross Revenue"), type="credit", amount=base_amount),
+                    LedgerEntry(account=tax_acct, type="credit", amount=event.tax_amount)
+                ]
+                
             if event.processing_fee > 0 and debit_account == OLPEngine._get_account_path(event, "Cash"):
                 entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Processing Expense"), type="debit", amount=event.processing_fee))
+            
             if total_cogs > 0:
-                entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Cost of Goods Sold"), type="debit", amount=total_cogs))
+                if event.expected_return_rate_basis_points > 0:
+                    recoverable_cost = (total_cogs * event.expected_return_rate_basis_points) // 10000
+                    net_cogs = total_cogs - recoverable_cost
+                    entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Cost of Goods Sold"), type="debit", amount=net_cogs))
+                    entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Right to Recover"), type="debit", amount=recoverable_cost))
+                else:
+                    entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Cost of Goods Sold"), type="debit", amount=total_cogs))
                 entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Inventory"), type="credit", amount=total_cogs))
+                
             desc = f"OLP Principal Immediate Sale booking for: {event.description}"
 
         tx = Transaction(
@@ -510,8 +711,8 @@ class OLPEngine:
             source_event_id=event.event_id,
             idempotency_key=event.idempotency_key,
             date=event.timestamp,
-            status="posted",
             description=f"OLP Principal Initial Over-Time booking for: {event.description}",
+            status="posted",
             entries=init_entries
         )
 
@@ -652,6 +853,7 @@ class OLPEngine:
             idempotency_key=event.idempotency_key,
             date=event.timestamp,
             description=f"OLP Agent Initial Over-Time booking for: {event.description}",
+            status="posted",
             entries=init_entries
         )
 

@@ -7,11 +7,11 @@ The **Open Ledger Protocol (OLP)** defines a standardized, metadata-driven syste
 
 ## 1. Accounting Context Headers
 
-Every OLP-compliant payload contains an `accounting_context` block. This block acts as the routing header for the double-entry compiler.
+Every OLP-compliant payload contains a global `accounting_context` block. Localized `accounting_context` overrides can also be specified at the **Line-Item** level to support multi-element bundles.
 
 | Header Field | Type | Allowed Values | Description |
 | :--- | :--- | :--- | :--- |
-| `entity_id` | String | e.g. `"acme_us"`, `"acme_de"`| Identifies the primary billing legal entity (subsidiary) responsible for the sale. |
+| `entity_id` | String | e.g. `"acme_us"` | Identifies the primary billing legal entity (subsidiary) responsible for the sale. |
 | `segment_id` | String | e.g. `"aws"`, `"twitch"` | Operating segment / line of business (LOB) classification for divisional reports (ASC 280). |
 | `is_intercompany`| Boolean | `true`, `false` | Tag indicating if the transaction is internal (intercompany) for downstream consolidation eliminations (ASC 810). |
 | `role` | String | `"principal"`, `"agent"` | Determines if the business sells as a principal (gross revenue) or as an agent (net commission). |
@@ -29,12 +29,12 @@ Every OLP-compliant payload contains an `accounting_context` block. This block a
 A standard OLP event payload contains transactional details, metadata routing headers, a required idempotency key, and monetary adjustments. 
 
 > [!IMPORTANT]
-> **Minor Currency Units (Integers)**: All money values in OLP v1.0 must be represented as integers in their minor currency units (e.g., $120.00 is represented as `12000` cents). This eliminates floating-point rounding errors.
+> **Minor Currency Units (Integers)**: All money values in OLP must be represented as integers in their minor currency units (e.g., $120.00 is represented as `12000` cents). This eliminates floating-point rounding errors.
 
 ```json
 {
   "event_id": "evt_100293",
-  "event_type": "payment_received", // ["payment_received" | "fulfillment_completed" | "immediate_sale" | "payment_settled" | "refund_issued" | "goods_returned" | "contract_billed" | "invoice_written_off" | "order_placed" | "charge_settled" | "payout_cleared"]
+  "event_type": "payment_received", // ["payment_received" | "fulfillment_completed" | "immediate_sale" | "payment_settled" | "refund_issued" | "goods_returned" | "contract_billed" | "invoice_written_off" | "order_placed" | "charge_settled" | "payout_cleared" | "gift_card_purchased" | "gift_card_redeemed" | "gift_card_breakage_recognized"]
   "timestamp": "2026-07-16T08:00:00Z",
   "idempotency_key": "idemp-9a8b7c6d-5e4f-3a2b", // Required to prevent double-posting
   "amount": 12000,                  // Gross amount in cents (inclusive of tax)
@@ -47,6 +47,7 @@ A standard OLP event payload contains transactional details, metadata routing he
   "discount_amount": 2000,          // Transaction discount ($20.00 represented as 2000)
   "capitalized_costs": 1200,        // Capitalized contract commissions (ASC 340-40, e.g. $12.00 = 1200)
   "functional_amount": 12000,       // local currency equivalent at settlement (ASC 830)
+  "expected_return_rate_basis_points": 300, // Expected returns reserve in basis points (e.g. 300 bps = 3% return rate) (ASC 606)
   "intercompany_entity_id": "acme_us", // Partner entity fulfilling order (ASC 810)
   "intercompany_transfer_amount": 8500, // Transfer pricing fee to route to partner books ($85.00 = 8500)
   "accounting_context": {
@@ -67,7 +68,13 @@ A standard OLP event payload contains transactional details, metadata routing he
     {
       "item_id": "prod_premium_annual",
       "price": 12000,
-      "cogs_estimate": 0
+      "cogs_estimate": 0,
+      "accounting_context": { // Optional line-item override (ASC 606 Bundle)
+        "role": "principal",
+        "product_type": "digital_saas",
+        "recognition": "over_time",
+        "term_months": 12
+      }
     }
   ]
 }
@@ -87,6 +94,7 @@ In OLP, flat account names are replaced by standardized hierarchical paths. This
 | **Order Clearing Account** | `/assets/receivables/order_clearing` |
 | **Payment Clearing Account** | `/assets/receivables/payment_clearing` |
 | **Intercompany Receivable** | `/assets/receivables/intercompany_<subsidiary_id>` |
+| **Right to Recover Returned Goods**| `/assets/receivables/right_to_recover` |
 | **Inventory** | `/assets/inventory` |
 | **Deferred Contract Costs (Assets)** | `/assets/deferred_costs/commissions` |
 | **Deferred Revenue** | `/liabilities/deferred/revenue` |
@@ -97,10 +105,13 @@ In OLP, flat account names are replaced by standardized hierarchical paths. This
 | **Sales Tax Payable (Local)** | `/liabilities/tax/payable/<jurisdiction_id>` |
 | **Commissions Payable** | `/liabilities/payables/commissions` |
 | **Intercompany Payable** | `/liabilities/payables/intercompany_<subsidiary_id>` |
+| **Refund Reserve Liability** | `/liabilities/refund_reserve` |
+| **Gift Card Liability** | `/liabilities/gift_card` |
 | **Gross Revenue** | `/equity/revenue/gross` |
 | **Subscription Revenue** | `/equity/revenue/subscription` |
 | **Commission Revenue** | `/equity/revenue/commission` |
 | **Intercompany Revenue** | `/equity/revenue/intercompany` |
+| **Gift Card Breakage Revenue** | `/equity/revenue/breakage` |
 | **Refunds & Allowances** | `/equity/revenue/refunds_allowances` |
 | **Gain on Foreign Exchange (FX)** | `/equity/gain_fx` |
 | **Payment Processing Expense** | `/expenses/processing/fees` |
@@ -161,11 +172,23 @@ The engine routes the event payload based on the `accounting_context` values and
 1. `Debit: [Asset Account]` (Gross Amount - Processing Fee) *[Skip fee if invoice]*
    * *Asset Account is `/assets/receivables/contract_assets` if billing_status is "unbilled", else `/assets/receivables/ar` if invoice, else `/assets/liquid/cash`*
 2. `Debit: /expenses/processing/fees` (Processing Fee) *[Skip if invoice]*
-3. `Credit: [Gross Revenue Account]` (Gross Amount - Tax Amount)
-   * *Uses override value for "Gross Revenue" if specified in `coa_overrides`*
+3. **Revenue Splits**:
+   * If `expected_return_rate_basis_points > 0`:
+     * Refund Reserve = `((Gross Amount - Tax Amount) * expected_return_rate_basis_points) // 10000`
+     * Recognized Revenue = `(Gross Amount - Tax Amount) - Refund Reserve`
+     * `Credit: [Gross Revenue Account]` (Recognized Revenue)
+     * `Credit: /liabilities/refund_reserve` (Refund Reserve)
+   * Else:
+     * `Credit: [Gross Revenue Account]` (Gross Amount - Tax Amount)
 4. `Credit: [Tax Account]` (Tax Amount)
-   * *Tax Account is `/liabilities/tax/payable/<jurisdiction_id>` if `tax_jurisdiction` is provided, else `/liabilities/tax/payable`*
-5. `Debit: /expenses/cogs` (COGS Estimate)
+5. **COGS Splits**:
+   * If `expected_return_rate_basis_points > 0`:
+     * Recoverable Cost = `(COGS Estimate * expected_return_rate_basis_points) // 10000`
+     * Net COGS = `COGS Estimate - Recoverable Cost`
+     * `Debit: /expenses/cogs` (Net COGS)
+     * `Debit: /assets/receivables/right_to_recover` (Recoverable Cost)
+   * Else:
+     * `Debit: /expenses/cogs` (COGS Estimate)
 6. `Credit: /assets/inventory` (COGS Estimate)
 
 ### Rule B: Principal + Digital/SaaS + Over-Time (Initial Booking)
@@ -186,8 +209,16 @@ The engine routes the event payload based on the `accounting_context` values and
 
 ---
 
-## 6. Parent Consolidation & Intercompany Eliminations (ASC 810)
+## 6. Real-World Adjustments Specifications
 
-When one parent company consolidates accounts for multiple operating segments and owned business entities:
-* Any event where `is_intercompany` is `true` is marked with `consolidation_type = "elimination"`.
-* Downstream reporting tools consolidate parent summaries by ignoring any transaction tagged as `"elimination"`, avoiding balance sheet double-counting.
+### A. Gift Card Lifecycles
+* **Event `"gift_card_purchased"`**:
+  * `Debit: /assets/liquid/cash` (Gross Amount - Processing Fee)
+  * `Debit: /expenses/processing/fees` (Processing Fee)
+  * `Credit: /liabilities/gift_card` (Gross Amount)
+* **Event `"gift_card_redeemed"`**:
+  * `Debit: /liabilities/gift_card` (Redeemed Amount)
+  * `Credit: /equity/revenue/gross` (Redeemed Amount)
+* **Event `"gift_card_breakage_recognized"`**:
+  * `Debit: /liabilities/gift_card` (Breakage Amount)
+  * `Credit: /equity/revenue/breakage` (Breakage Amount)

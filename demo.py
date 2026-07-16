@@ -292,8 +292,6 @@ def run_demo():
     # Scenario H: Brand-Specific Account Pathing Overrides (Audible LOB)
     # -------------------------------------------------------------------------
     print("SCENARIO H: Brand-Specific Account Pathing Overrides (Audible Segment).")
-    print("Audible customer buys a monthly membership for $15.00 (1500c).")
-    print("Audible overrides standard 'Subscription Revenue' with a custom audiobook account:")
     event_h = OLPEvent(
         event_id="evt_audible_sub_808",
         timestamp="2026-07-16T12:00:00Z",
@@ -326,8 +324,6 @@ def run_demo():
     # Scenario I: Intercompany Consolidations & Eliminations (AWS bills Twitch)
     # -------------------------------------------------------------------------
     print("SCENARIO I: Intercompany Consolidations & Eliminations (ASC 810).")
-    print("AWS bills Twitch $500.00 (50000c) for cloud hosting. This is an internal transfer.")
-    print("Both compiled transactions must be marked as 'ELIMINATION' to bypass parent consolidated earnings:")
     event_i = OLPEvent(
         event_id="evt_internal_host_900",
         timestamp="2026-07-16T12:00:00Z",
@@ -354,6 +350,118 @@ def run_demo():
     print(">>> 2. Fulfilling Entity (Twitch Ledger - twitch_corp):")
     if result_i.intercompany_transaction:
         format_transaction(result_i.intercompany_transaction)
+
+    # -------------------------------------------------------------------------
+    # Scenario J: Multi-Element Bundle Allocations (Kindle + SaaS)
+    # -------------------------------------------------------------------------
+    print("SCENARIO J: Multi-Element Bundle Allocations (Kindle + Unlimited Sub - ASC 606).")
+    print("Customer buys a Kindle ($100.00 / 10000c - point_in_time) + 3-month SaaS Sub ($30.00 / 3000c - over_time) bundle.")
+    print("Gross Price is $130.00 + $13.00 tax = $143.00 (14300c). Processor fee is $3.90 (390c).")
+    device_ctx = AccountingContext(role="principal", product_type="physical", recognition="point_in_time")
+    sub_ctx = AccountingContext(role="principal", product_type="digital_saas", recognition="over_time", term_months=3)
+    
+    event_j = OLPEvent(
+        event_id="evt_bundle_order_1122",
+        timestamp="2026-07-16T12:00:00Z",
+        amount=14300,
+        tax_amount=1300,
+        processing_fee=390,
+        currency="USD",
+        description="Kindle Reader and Sub Bundle Order",
+        customer_id="cust_reader_77",
+        idempotency_key="idemp_bundle_order_1122",
+        accounting_context=device_ctx,
+        line_items=[
+            LineItem(item_id="kindle_hardware", price=10000, cogs_estimate=3500), # physical point-in-time
+            LineItem(item_id="kindle_unlimited_3mo", price=3000, accounting_context=sub_ctx) # overrides with over-time SaaS
+        ]
+    )
+    result_j = OLPEngine.compile_event(event_j)
+    print(">>> Initial Booking (Consolidates point-in-time cash/revenue and over-time deferred liability):")
+    format_transaction(result_j.initial_transaction)
+    print(">>> Amortization schedule (amortizes subscription portion only):")
+    for tx in result_j.amortization_schedule:
+        format_transaction(tx)
+
+    # -------------------------------------------------------------------------
+    # Scenario K: Sales Returns Reserves & Refund Liabilities (ASC 606)
+    # -------------------------------------------------------------------------
+    print("SCENARIO K: Sales Returns Reserves & Refund Liabilities (ASC 606).")
+    print("Book sold for $100.00 (10000c) with COGS $40.00 (4000c). Returns Reserve expected rate is 3% (300 bps).")
+    print("Net revenue = $97.00, Refund Reserve = $3.00. Net COGS = $38.80, Right to Recover Asset = $1.20.")
+    event_k = OLPEvent(
+        event_id="evt_returns_reserve_01",
+        timestamp="2026-07-16T12:00:00Z",
+        amount=10000,
+        currency="USD",
+        description="Book sold with return reserves policy",
+        customer_id="cust_student_90",
+        expected_return_rate_basis_points=300,
+        idempotency_key="idemp_returns_reserve_01",
+        accounting_context=AccountingContext(
+            role="principal",
+            product_type="physical",
+            recognition="point_in_time",
+            payment_method="card"
+        ),
+        line_items=[
+            LineItem(item_id="hardcover_chemistry", price=10000, cogs_estimate=4000)
+        ]
+    )
+    result_k = OLPEngine.compile_event(event_k)
+    format_transaction(result_k.initial_transaction)
+
+    # -------------------------------------------------------------------------
+    # Scenario L: Gift Card Lifecycle (Purchases, Redemptions & Breakage)
+    # -------------------------------------------------------------------------
+    print("SCENARIO L: Gift Card Lifecycle (Purchases, Redemptions & Breakage).")
+    gc_ctx = AccountingContext(role="principal", product_type="digital_download", recognition="point_in_time")
+    
+    print(">>> 1. Customer buys $100.00 Gift Card. Stripe charges $3.00 fee:")
+    event_l_buy = OLPEvent(
+        event_id="evt_gc_purchase_55",
+        event_type="gift_card_purchased",
+        timestamp="2026-07-16T12:00:00Z",
+        amount=10000,
+        processing_fee=300,
+        currency="USD",
+        description="Store Gift Card $100.00 Purchase",
+        customer_id="cust_giftee",
+        idempotency_key="idemp_gc_purchase_55",
+        accounting_context=gc_ctx
+    )
+    result_l_buy = OLPEngine.compile_event(event_l_buy)
+    format_transaction(result_l_buy.initial_transaction)
+
+    print(">>> 2. Customer redeems $40.00 of the Gift Card balance on books:")
+    event_l_red = OLPEvent(
+        event_id="evt_gc_redeem_55",
+        event_type="gift_card_redeemed",
+        timestamp="2026-07-20T14:00:00Z",
+        amount=4000,
+        currency="USD",
+        description="Redeem $40.00 GC balance",
+        customer_id="cust_giftee",
+        idempotency_key="idemp_gc_redeem_55",
+        accounting_context=gc_ctx
+    )
+    result_l_red = OLPEngine.compile_event(event_l_red)
+    format_transaction(result_l_red.initial_transaction)
+
+    print(">>> 3. Customer lets balance expire. Recognize $10.00 GC breakage revenue:")
+    event_l_brk = OLPEvent(
+        event_id="evt_gc_breakage_55",
+        event_type="gift_card_breakage_recognized",
+        timestamp="2026-07-30T10:00:00Z",
+        amount=1000,
+        currency="USD",
+        description="Expired gift card breakage sweep",
+        customer_id="cust_giftee",
+        idempotency_key="idemp_gc_breakage_55",
+        accounting_context=gc_ctx
+    )
+    result_l_brk = OLPEngine.compile_event(event_l_brk)
+    format_transaction(result_l_brk.initial_transaction)
 
 if __name__ == "__main__":
     run_demo()
