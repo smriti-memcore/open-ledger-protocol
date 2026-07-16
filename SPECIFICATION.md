@@ -1,5 +1,5 @@
 # Open Ledger Protocol (OLP) Specification
-**Version 3.0.0-draft**
+**Version 1.0.0-draft**
 
 The **Open Ledger Protocol (OLP)** defines a standardized, metadata-driven system for financial accounting integrations. By decoupling business event creation from ledger compilation, OLP allows commerce/checkout platforms to send generic transaction events, which are dynamically mapped to double-entry ledger entries.
 

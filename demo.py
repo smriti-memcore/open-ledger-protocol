@@ -19,7 +19,7 @@ def format_transaction(tx):
     print("=" * 80 + "\n")
 
 def run_demo():
-    print("RUNNING OPEN LEDGER PROTOCOL (OLP) DEMO - VERSION 3.0 (ENTERPRISE PATHS & CENTS)\n")
+    print("RUNNING OPEN LEDGER PROTOCOL (OLP) DEMO - VERSION 1.0 (ENTERPRISE PATHS & CENTS)\n")
     
     # -------------------------------------------------------------------------
     # Scenario A: E-Commerce Retail Sale with VAT, Discount, and Stripe fees

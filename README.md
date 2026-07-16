@@ -1,10 +1,10 @@
 # Open Ledger Protocol (OLP) Reference Implementation
 
-This project contains the reference implementation of the **Open Ledger Protocol (OLP) Version 3.0**. 
+This project contains the reference implementation of the **Open Ledger Protocol (OLP) Version 1.0**. 
 
 OLP is an open, developer-centric financial accounting specification that abstracts standard double-entry bookkeeping rules out of application database layers. It acts like an "HTTP header" standard for sales events: by attaching key context headers (e.g., role, product type, recognition model), a checkout engine can post raw events and have them compiled into compliant, balanced journal entries dynamically.
 
-## Key Features in Version 3.0
+## Key Features in Version 1.0
 
 *   **Integer-Cents Arithmetic**: All money values are integers in minor currency units (cents, e.g. `$100.00` = `10000`) to avoid IEEE 754 float rounding errors.
 *   **Standard Ledger Account Paths**: Account names map to hierarchical charts of accounts (e.g. `/assets/liquid/cash` or `/liabilities/deferred/revenue`) matching patterns used by enterprise engines like Twisp and Fragment.
