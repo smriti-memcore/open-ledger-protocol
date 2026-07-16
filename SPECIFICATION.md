@@ -11,6 +11,7 @@ Every OLP-compliant payload contains an `accounting_context` block. This block a
 
 | Header Field | Type | Allowed Values | Description |
 | :--- | :--- | :--- | :--- |
+| `entity_id` | String | e.g. `"acme_us"`, `"acme_de"`| Identifies the primary billing legal entity (subsidiary) responsible for the sale. |
 | `role` | String | `"principal"`, `"agent"` | Determines if the business sells as a principal (gross revenue) or as an agent (net commission). |
 | `product_type` | String | `"physical"`, `"digital_saas"`, `"digital_download"` | Determines the nature of the product and cost implications. |
 | `recognition` | String | `"point_in_time"`, `"over_time"` | Dictates whether revenue is recognized immediately or ratably over a term. |
@@ -38,11 +39,15 @@ A standard OLP event payload contains transactional details, metadata routing he
   "description": "Premium Subscription Annual Plan",
   "customer_id": "cust_8829",
   "tax_amount": 1000,               // Taxes included in the amount ($10.00 represented as 1000)
+  "tax_jurisdiction": "DE",         // Country/state code for local tax credit segregation (e.g. "DE" or "US-CA")
   "processing_fee": 380,            // Merchant gateway fee ($3.80 represented as 380)
   "discount_amount": 2000,          // Transaction discount ($20.00 represented as 2000)
   "capitalized_costs": 1200,        // Capitalized contract commissions (ASC 340-40, e.g. $12.00 = 1200)
   "functional_amount": 12000,       // local currency equivalent at settlement (ASC 830)
+  "intercompany_entity_id": "acme_us", // Partner entity providing services (ASC 810)
+  "intercompany_transfer_amount": 8500, // Transfer pricing fee to route to partner books ($85.00 = 8500)
   "accounting_context": {
+    "entity_id": "acme_de",
     "role": "principal",
     "product_type": "digital_saas",
     "recognition": "over_time",
@@ -73,17 +78,21 @@ In OLP, flat account names are replaced by standardized hierarchical paths. This
 | **Contract Assets (Unbilled AR)** | `/assets/receivables/contract_assets` |
 | **Order Clearing Account** | `/assets/receivables/order_clearing` |
 | **Payment Clearing Account** | `/assets/receivables/payment_clearing` |
+| **Intercompany Receivable** | `/assets/receivables/intercompany_<subsidiary_id>` |
 | **Inventory** | `/assets/inventory` |
 | **Deferred Contract Costs (Assets)** | `/assets/deferred_costs/commissions` |
 | **Deferred Revenue** | `/liabilities/deferred/revenue` |
 | **Deferred Payable (Vendor)** | `/liabilities/deferred/payable_vendor` |
 | **Deferred Commission Revenue**| `/liabilities/deferred/commission` |
 | **Accounts Payable (Vendor)** | `/liabilities/payables/vendor` |
-| **Sales Tax Payable** | `/liabilities/tax/payable` |
+| **Sales Tax Payable (Global)** | `/liabilities/tax/payable` |
+| **Sales Tax Payable (Local)** | `/liabilities/tax/payable/<jurisdiction_id>` |
 | **Commissions Payable** | `/liabilities/payables/commissions` |
+| **Intercompany Payable** | `/liabilities/payables/intercompany_<subsidiary_id>` |
 | **Gross Revenue** | `/equity/revenue/gross` |
 | **Subscription Revenue** | `/equity/revenue/subscription` |
 | **Commission Revenue** | `/equity/revenue/commission` |
+| **Intercompany Revenue** | `/equity/revenue/intercompany` |
 | **Refunds & Allowances** | `/equity/revenue/refunds_allowances` |
 | **Gain on Foreign Exchange (FX)** | `/equity/gain_fx` |
 | **Payment Processing Expense** | `/expenses/processing/fees` |
@@ -91,6 +100,7 @@ In OLP, flat account names are replaced by standardized hierarchical paths. This
 | **Amortized Commission Expense**| `/expenses/commissions` |
 | **Bad Debt Expense** | `/expenses/bad_debt` |
 | **Loss on Foreign Exchange (FX)** | `/expenses/fx_loss` |
+| **Intercompany Service Expense** | `/expenses/intercompany` |
 
 ---
 
@@ -124,9 +134,9 @@ A transaction compiled by the OLP engine must satisfy double-entry requirements:
       "amount": 11000               // Base liability ($110.00)
     },
     {
-      "account": "/liabilities/tax/payable",
+      "account": "/liabilities/tax/payable/de",
       "type": "credit",
-      "amount": 1000                // Tax liability ($10.00)
+      "amount": 1000                // Dynamic Local Tax liability ($10.00)
     }
   ]
 }
@@ -143,7 +153,8 @@ The engine routes the event payload based on the `accounting_context` values and
    * *Asset Account is `/assets/receivables/contract_assets` if billing_status is "unbilled", else `/assets/receivables/ar` if invoice, else `/assets/liquid/cash`*
 2. `Debit: /expenses/processing/fees` (Processing Fee) *[Skip if invoice]*
 3. `Credit: /equity/revenue/gross` (Gross Amount - Tax Amount)
-4. `Credit: /liabilities/tax/payable` (Tax Amount)
+4. `Credit: [Tax Account]` (Tax Amount)
+   * *Tax Account is `/liabilities/tax/payable/<jurisdiction_id>` if `tax_jurisdiction` is provided, else `/liabilities/tax/payable`*
 5. `Debit: /expenses/cogs` (COGS Estimate)
 6. `Credit: /assets/inventory` (COGS Estimate)
 
@@ -151,7 +162,7 @@ The engine routes the event payload based on the `accounting_context` values and
 1. `Debit: [Asset Account]` (Gross Amount - Processing Fee)
 2. `Debit: /expenses/processing/fees` (Processing Fee)
 3. `Credit: /liabilities/deferred/revenue` (Gross Amount - Tax Amount)
-4. `Credit: /liabilities/tax/payable` (Tax Amount)
+4. `Credit: [Tax Account]` (Tax Amount)
 * **Deferred Costs (ASC 340-40)**: If `capitalized_costs` is provided:
   5. `Debit: /assets/deferred_costs/commissions` (Capitalized Cost)
   6. `Credit: /liabilities/payables/commissions` (Capitalized Cost)
@@ -173,14 +184,14 @@ The engine routes the event payload based on the `accounting_context` values and
   2. `Debit: /expenses/processing/fees` (Processing Fee)
   3. `Credit: /liabilities/payables/vendor` (Vendor Cut)
   4. `Credit: /equity/revenue/commission` (Commission)
-  5. `Credit: /liabilities/tax/payable` (Tax Amount)
+  5. `Credit: [Tax Account]` (Tax Amount)
 
 ### Rule D: Agent + Digital/SaaS + Over-Time (Initial Booking)
 1. `Debit: [Asset Account]` (Gross Amount - Processing Fee)
 2. `Debit: /expenses/processing/fees` (Processing Fee)
 3. `Credit: /liabilities/deferred/payable_vendor` (Vendor Cut)
 4. `Credit: /liabilities/deferred/commission` (Commission)
-5. `Credit: /liabilities/tax/payable` (Tax Amount)
+5. `Credit: [Tax Account]` (Tax Amount)
 * **Amortization (per month)**:
   1. `Debit: /liabilities/deferred/payable_vendor` (Monthly Vendor Cents)
   2. `Credit: /liabilities/payables/vendor` (Monthly Vendor Cents)
@@ -192,11 +203,11 @@ The engine routes the event payload based on the `accounting_context` values and
 ## 6. Real-World Adjustments Specifications
 
 ### A. Accounts Receivable (AR) Invoicing Lifecycle
-If `payment_method` is `"invoice"`, the Day 1 purchase event debits `Accounts Receivable` instead of `Cash` and bypasses the `processing_fee` (which is typically zero or charged later).
+If `payment_method` is `"invoice"`, the Day 1 purchase event debits `Accounts Receivable` instead of `Cash`.
 * **Initial booking (Day 1 invoice):**
   * `Debit: /assets/receivables/ar` (Gross Amount)
   * `Credit: /equity/revenue/gross` (Base Price)
-  * `Credit: /liabilities/tax/payable` (Tax Amount)
+  * `Credit: [Tax Account]` (Tax Amount)
 * **Subsequent collection event (`"payment_settled"`):**
   * `Debit: /assets/liquid/cash` (Gross Amount - Processing Fee)
   * `Debit: /expenses/processing/fees` (Processing Fee)
@@ -230,18 +241,8 @@ If a customer defaults on an outstanding invoice, compiling an `"invoice_written
 * **Event `"refund_issued"`**:
   * Records customer refund using a GAAP contra-revenue account rather than deleting transactions.
   * `Debit: /equity/revenue/refunds_allowances` (Base Price)
-  * `Debit: /liabilities/tax/payable` (Tax Amount)
+  * `Debit: [Tax Account]` (Tax Amount)
   * `Credit: /assets/liquid/cash` (Gross Amount) *[Or credit `/assets/receivables/ar` if payment method is invoice]*
-* **Event `"goods_returned"`**:
-  * Reverses cost of goods sold and restores physical inventory to stock.
-  * `Debit: /assets/inventory` (Original COGS Cents)
-  * `Credit: /expenses/cogs` (Original COGS Cents)
-
-### F. Proportional Discount Allocations (ASC 606 Step 3)
-If a transaction-level `discount_amount` is provided, the compiler must distribute it proportionally across all line items based on their standalone pricing weights before applying recognition rules.
-* **Formula**:
-  $$\text{Net Price}_i = \text{Price}_i - \left( \text{Discount} \times \frac{\text{Price}_i}{\sum \text{Price}} \right)$$
-  *(Using integer-division checks to guarantee the sum of discounts exactly matches `discount_amount`)*
 
 ---
 
@@ -250,18 +251,31 @@ If a transaction-level `discount_amount` is provided, the compiler must distribu
 For decoupled transactional setups where the sales pipeline runs separately from payment processor collections and treasury bank payouts:
 
 ### A. Business Order Placed (`"order_placed"`)
-Fires when checkout completes. Maps the customer order without knowing merchant processor settlement details.
 * `Debit: /assets/receivables/order_clearing` (Gross Amount)
 * `Credit: /equity/revenue/gross` (Base Price)
-* `Credit: /liabilities/tax/payable` (Tax Amount)
+* `Credit: [Tax Account]` (Tax Amount)
 
 ### B. Processor Charge Settled (`"charge_settled"`)
-Fires when the card gateway settles the transaction, tracking processing fees.
 * `Debit: /assets/receivables/payment_clearing` (Gross Amount - Processing Fee)
 * `Debit: /expenses/processing/fees` (Processing Fee)
 * `Credit: /assets/receivables/order_clearing` (Gross Amount)
 
 ### C. Treasury Payout Cleared (`"payout_cleared"`)
-Fires when the bank feed clears the deposit into the operating cash account.
 * `Debit: /assets/liquid/cash` (Settled Net Amount)
 * `Credit: /assets/receivables/payment_clearing` (Settled Net Amount)
+
+---
+
+## 8. Multinational Corporations (MNC) & Intercompany Transfers (ASC 810)
+
+When billing occurs through one local subsidiary but infrastructure/fulfillment is performed by another parent entity, two distinct legal ledgers are compiled.
+
+### A. Billing Entity (Subsidiary) Booking
+Appends intercompany service lines to the subsidiary's ledger transactions:
+* `Debit: /expenses/intercompany` (Intercompany Transfer Amount)
+* `Credit: /liabilities/payables/intercompany_<partner_entity_id>` (Intercompany Transfer Amount)
+
+### B. Fulfilling Entity (Partner/Parent) Booking
+Generates a separate, balancing transaction for the partner's ledger:
+* `Debit: /assets/receivables/intercompany_<subsidiary_entity_id>` (Intercompany Transfer Amount)
+* `Credit: /equity/revenue/intercompany` (Intercompany Transfer Amount)

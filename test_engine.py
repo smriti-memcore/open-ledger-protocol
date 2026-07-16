@@ -387,17 +387,7 @@ class TestOLPEngine(unittest.TestCase):
         self.assertEqual(debits[ACCOUNT_PATHS["Bad Debt Expense"]], 5000)
         self.assertEqual(credits[ACCOUNT_PATHS["Accounts Receivable"]], 5000)
 
-    # =========================================================================
-    # DECOUPLED MULTI-PIPELINE RECONCILIATION TEST (PHASE 5)
-    # =========================================================================
-
     def test_decoupled_pipeline_reconciliation(self):
-        """
-        Verify multi-pipeline reconciliation flow at scale.
-        Step 1: Order Placed -> Debit Order Clearing, Credit Gross Rev & Tax
-        Step 2: Charge Settled -> Debit Payment Clearing & Processing Fee, Credit Order Clearing
-        Step 3: Payout Cleared -> Debit Operating Cash, Credit Payment Clearing
-        """
         ctx = AccountingContext(
             role="principal",
             product_type="physical",
@@ -405,13 +395,12 @@ class TestOLPEngine(unittest.TestCase):
             payment_method="card"
         )
         
-        # Step 1: Business Side Checkout creates the order log
         order_event = OLPEvent(
             event_id="order_112233",
             event_type="order_placed",
             idempotency_key="idemp_order_112",
             timestamp="2026-07-16T12:00:00Z",
-            amount=10800, # $108.00 inclusive of tax
+            amount=10800,
             tax_amount=800,
             currency="USD",
             description="Laptop Stand checkout order",
@@ -425,19 +414,17 @@ class TestOLPEngine(unittest.TestCase):
         debits_o = {e.account: e.amount for e in tx_order.entries if e.type == "debit"}
         credits_o = {e.account: e.amount for e in tx_order.entries if e.type == "credit"}
         
-        # Gross revenue recognized, balance sits in Order Clearing
         self.assertEqual(debits_o[ACCOUNT_PATHS["Order Clearing"]], 10800)
         self.assertEqual(credits_o[ACCOUNT_PATHS["Gross Revenue"]], 10000)
         self.assertEqual(credits_o[ACCOUNT_PATHS["Sales Tax Payable"]], 800)
 
-        # Step 2: Card processor settles payment and takes transaction fee
         settle_event = OLPEvent(
             event_id="settle_112233",
             event_type="charge_settled",
             idempotency_key="idemp_settle_112",
             timestamp="2026-07-16T12:05:00Z",
-            amount=10800, # Gross settled value
-            processing_fee=320, # $3.20 Stripe fee
+            amount=10800,
+            processing_fee=320,
             currency="USD",
             description="Stripe charge settlement for order 112233",
             customer_id="cust_jim",
@@ -450,18 +437,16 @@ class TestOLPEngine(unittest.TestCase):
         debits_s = {e.account: e.amount for e in tx_settle.entries if e.type == "debit"}
         credits_s = {e.account: e.amount for e in tx_settle.entries if e.type == "credit"}
         
-        # Order clearing credited, funds moved to Payment Clearing net of fee
         self.assertEqual(credits_s[ACCOUNT_PATHS["Order Clearing"]], 10800)
         self.assertEqual(debits_s[ACCOUNT_PATHS["Payment Clearing"]], 10480)
         self.assertEqual(debits_s[ACCOUNT_PATHS["Payment Processing Expense"]], 320)
 
-        # Step 3: Treasury processes Stripe bank payout file
         payout_event = OLPEvent(
             event_id="payout_112233",
             event_type="payout_cleared",
             idempotency_key="idemp_payout_112",
             timestamp="2026-07-18T06:00:00Z",
-            amount=10480, # Bank deposit matches net payout
+            amount=10480,
             currency="USD",
             description="Bank transfer payout from Stripe",
             customer_id="cust_jim",
@@ -474,9 +459,108 @@ class TestOLPEngine(unittest.TestCase):
         debits_p = {e.account: e.amount for e in tx_payout.entries if e.type == "debit"}
         credits_p = {e.account: e.amount for e in tx_payout.entries if e.type == "credit"}
         
-        # Cash debited, Payment clearing credited (zeroed out)
         self.assertEqual(debits_p[ACCOUNT_PATHS["Cash"]], 10480)
         self.assertEqual(credits_p[ACCOUNT_PATHS["Payment Clearing"]], 10480)
+
+    # =========================================================================
+    # MULTINATIONAL CORPORATION & TAX JURISDICTION TESTS (PHASE 6)
+    # =========================================================================
+
+    def test_multinational_tax_jurisdictions(self):
+        """
+        Verify localized tax accounting splits.
+        """
+        event = OLPEvent(
+            event_id="evt_de_sale",
+            idempotency_key="idemp_de_sale",
+            timestamp="2026-07-16T12:00:00Z",
+            amount=11900, # €119.00 inclusive of tax
+            tax_amount=1900, # German VAT 19%
+            tax_jurisdiction="DE", # Dynamic localization
+            currency="EUR",
+            description="Sale to German client",
+            customer_id="cust_helmut",
+            accounting_context=AccountingContext(
+                entity_id="acme_de",
+                role="principal",
+                product_type="digital_download",
+                recognition="point_in_time"
+            )
+        )
+        result = OLPEngine.compile_event(event)
+        tx = result.initial_transaction
+        self.assertTrue(tx.is_balanced())
+        
+        credits = {e.account: e.amount for e in tx.entries if e.type == "credit"}
+        
+        # Verify that tax hits the German-specific tax liability path
+        self.assertEqual(credits["/liabilities/tax/payable/de"], 1900)
+        self.assertEqual(credits[ACCOUNT_PATHS["Gross Revenue"]], 10000)
+
+    def test_intercompany_transfer_pricing(self):
+        """
+        ASC 810 Compliance: Acme Germany books a sale for €100.00 base, but
+        infrastructure is hosted by Acme US.
+        German ledger books an intercompany expense of €85.00 (8500 cents) and intercompany payable.
+        US ledger books intercompany receivable of €85.00 and intercompany revenue.
+        """
+        event = OLPEvent(
+            event_id="evt_cross_border",
+            idempotency_key="idemp_cross_border",
+            timestamp="2026-07-16T12:00:00Z",
+            amount=11900,
+            tax_amount=1900,
+            tax_jurisdiction="DE",
+            currency="EUR",
+            description="Acme Germany sells, Acme US fulfills",
+            customer_id="cust_helmut",
+            intercompany_entity_id="acme_us", # Parent fulfiller
+            intercompany_transfer_amount=8500, # transfer pricing fee
+            accounting_context=AccountingContext(
+                entity_id="acme_de",
+                role="principal",
+                product_type="digital_download",
+                recognition="point_in_time"
+            )
+        )
+        result = OLPEngine.compile_event(event)
+        
+        # 1. Verify German ledger
+        tx_de = result.initial_transaction
+        self.assertTrue(tx_de.is_balanced())
+        debits_de = {e.account: e.amount for e in tx_de.entries if e.type == "debit"}
+        credits_de = {e.account: e.amount for e in tx_de.entries if e.type == "credit"}
+        
+        self.assertEqual(debits_de[ACCOUNT_PATHS["Intercompany Expense"]], 8500)
+        self.assertEqual(credits_de["/liabilities/payables/intercompany_acme_us"], 8500)
+
+        # 2. Verify US ledger
+        tx_us = result.intercompany_transaction
+        self.assertIsNotNone(tx_us)
+        self.assertTrue(tx_us.is_balanced())
+        
+        debits_us = {e.account: e.amount for e in tx_us.entries if e.type == "debit"}
+        credits_us = {e.account: e.amount for e in tx_us.entries if e.type == "credit"}
+        
+        self.assertEqual(debits_us["/assets/receivables/intercompany_acme_de"], 8500)
+        self.assertEqual(credits_us[ACCOUNT_PATHS["Intercompany Revenue"]], 8500)
+
+    def test_validation_errors(self):
+        with self.assertRaises(ValueError):
+            OLPEngine.compile_event(OLPEvent(
+                event_id="evt_err",
+                idempotency_key="idemp_err",
+                timestamp="2026-07-16T12:00:00Z",
+                amount=10000,
+                currency="USD",
+                description="Error Sub",
+                customer_id="cust_err",
+                accounting_context=AccountingContext(
+                    role="principal",
+                    product_type="digital_saas",
+                    recognition="over_time"
+                )
+            ))
 
 if __name__ == "__main__":
     unittest.main()

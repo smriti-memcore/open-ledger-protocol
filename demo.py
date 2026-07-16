@@ -256,5 +256,40 @@ def run_demo():
     result_f_payout = OLPEngine.compile_event(event_f_payout)
     format_transaction(result_f_payout.initial_transaction)
 
+    # -------------------------------------------------------------------------
+    # Scenario G: Multinational Subsidiaries and Intercompany Transfers (ASC 810)
+    # -------------------------------------------------------------------------
+    print("SCENARIO G: Multinational Subsidiaries and Intercompany Transfers (ASC 810).")
+    print("Acme Germany GmbH (acme_de) bills Helmut €119.00 (11900c, inclusive of €19.00 German VAT).")
+    print("Fulfillment is performed by Acme US (acme_us) for an intercompany transfer fee of €85.00 (8500c).")
+    event_g = OLPEvent(
+        event_id="evt_cross_border_7788",
+        timestamp="2026-07-16T12:00:00Z",
+        amount=11900,
+        tax_amount=1900,
+        tax_jurisdiction="DE",
+        currency="EUR",
+        description="German checkout with US fulfillment",
+        customer_id="cust_helmut",
+        intercompany_entity_id="acme_us",
+        intercompany_transfer_amount=8500,
+        idempotency_key="idemp_cross_border_7788",
+        accounting_context=AccountingContext(
+            entity_id="acme_de",
+            role="principal",
+            product_type="digital_download",
+            recognition="point_in_time",
+            payment_method="card"
+        )
+    )
+    result_g = OLPEngine.compile_event(event_g)
+    
+    print(">>> 1. Subsidiary Books (Acme Germany GmbH Ledger - acme_de):")
+    format_transaction(result_g.initial_transaction)
+    
+    print(">>> 2. Parent Fulfiller Books (Acme US Inc Ledger - acme_us):")
+    if result_g.intercompany_transaction:
+        format_transaction(result_g.intercompany_transaction)
+
 if __name__ == "__main__":
     run_demo()
