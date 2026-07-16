@@ -7,6 +7,7 @@ def format_transaction(tx):
     print(f"Idempotency Key: {tx.idempotency_key}")
     print(f"Date:            {tx.date}")
     print(f"Status:          {tx.status.upper()}")
+    print(f"Consolidation:   {tx.consolidation_type.upper()}")
     print(f"Description:     {tx.description}")
     print("-" * 80)
     print(f"{'Standard Ledger Account Path':<45} | {'Type':<8} | {'Amount ($)':>12}")
@@ -260,8 +261,6 @@ def run_demo():
     # Scenario G: Multinational Subsidiaries and Intercompany Transfers (ASC 810)
     # -------------------------------------------------------------------------
     print("SCENARIO G: Multinational Subsidiaries and Intercompany Transfers (ASC 810).")
-    print("Acme Germany GmbH (acme_de) bills Helmut €119.00 (11900c, inclusive of €19.00 German VAT).")
-    print("Fulfillment is performed by Acme US (acme_us) for an intercompany transfer fee of €85.00 (8500c).")
     event_g = OLPEvent(
         event_id="evt_cross_border_7788",
         timestamp="2026-07-16T12:00:00Z",
@@ -283,13 +282,78 @@ def run_demo():
         )
     )
     result_g = OLPEngine.compile_event(event_g)
-    
     print(">>> 1. Subsidiary Books (Acme Germany GmbH Ledger - acme_de):")
     format_transaction(result_g.initial_transaction)
-    
     print(">>> 2. Parent Fulfiller Books (Acme US Inc Ledger - acme_us):")
     if result_g.intercompany_transaction:
         format_transaction(result_g.intercompany_transaction)
+
+    # -------------------------------------------------------------------------
+    # Scenario H: Brand-Specific Account Pathing Overrides (Audible LOB)
+    # -------------------------------------------------------------------------
+    print("SCENARIO H: Brand-Specific Account Pathing Overrides (Audible Segment).")
+    print("Audible customer buys a monthly membership for $15.00 (1500c).")
+    print("Audible overrides standard 'Subscription Revenue' with a custom audiobook account:")
+    event_h = OLPEvent(
+        event_id="evt_audible_sub_808",
+        timestamp="2026-07-16T12:00:00Z",
+        amount=1500,
+        currency="USD",
+        description="Audible Premium Monthly Subscription",
+        customer_id="cust_listener_11",
+        idempotency_key="idemp_audible_808",
+        accounting_context=AccountingContext(
+            entity_id="audible_inc",
+            segment_id="audible",
+            role="principal",
+            product_type="digital_saas",
+            recognition="over_time",
+            term_months=1,
+            payment_method="card",
+            coa_overrides={
+                "Subscription Revenue": "/equity/revenue/audio_subscriptions"
+            }
+        )
+    )
+    result_h = OLPEngine.compile_event(event_h)
+    print(">>> Initial Booking (Standard asset and deferred accounts):")
+    format_transaction(result_h.initial_transaction)
+    print(">>> Amortization schedule (routes credit strictly to the custom overridden path):")
+    for tx in result_h.amortization_schedule:
+        format_transaction(tx)
+
+    # -------------------------------------------------------------------------
+    # Scenario I: Intercompany Consolidations & Eliminations (AWS bills Twitch)
+    # -------------------------------------------------------------------------
+    print("SCENARIO I: Intercompany Consolidations & Eliminations (ASC 810).")
+    print("AWS bills Twitch $500.00 (50000c) for cloud hosting. This is an internal transfer.")
+    print("Both compiled transactions must be marked as 'ELIMINATION' to bypass parent consolidated earnings:")
+    event_i = OLPEvent(
+        event_id="evt_internal_host_900",
+        timestamp="2026-07-16T12:00:00Z",
+        amount=50000,
+        currency="USD",
+        description="AWS internal hosting fees billed to Twitch",
+        customer_id="cust_twitch_corporate",
+        intercompany_entity_id="twitch_corp",
+        intercompany_transfer_amount=50000,
+        idempotency_key="idemp_internal_host_900",
+        accounting_context=AccountingContext(
+            entity_id="aws_corp",
+            segment_id="aws",
+            is_intercompany=True,
+            role="principal",
+            product_type="digital_download",
+            recognition="point_in_time",
+            payment_method="card"
+        )
+    )
+    result_i = OLPEngine.compile_event(event_i)
+    print(">>> 1. Billing Entity (AWS Ledger - aws_corp):")
+    format_transaction(result_i.initial_transaction)
+    print(">>> 2. Fulfilling Entity (Twitch Ledger - twitch_corp):")
+    if result_i.intercompany_transaction:
+        format_transaction(result_i.intercompany_transaction)
 
 if __name__ == "__main__":
     run_demo()

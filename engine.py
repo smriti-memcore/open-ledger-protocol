@@ -9,10 +9,13 @@ class AccountingContext:
     product_type: str               # "physical" | "digital_saas" | "digital_download"
     recognition: str                # "point_in_time" | "over_time"
     entity_id: str = "default_entity"  # MNC legal entity identifier
+    segment_id: Optional[str] = None   # Operating segment / LOB tag (ASC 280)
+    is_intercompany: bool = False      # Intercompany consolidation elimination flag (ASC 810)
     term_months: Optional[int] = None
     platform_fee_percent: float = 0.20
     payment_method: str = "card"    # "card" | "invoice"
     billing_status: str = "billed"  # "billed" | "unbilled"
+    coa_overrides: dict = field(default_factory=dict) # Per-brand chart overrides
 
 @dataclass
 class LineItem:
@@ -55,6 +58,7 @@ class Transaction:
     date: str
     description: str
     status: str = "posted"          # "pending" | "posted"
+    consolidation_type: str = "standard" # "standard" | "elimination" (ASC 810)
     entries: List[LedgerEntry] = field(default_factory=list)
 
     def is_balanced(self) -> bool:
@@ -129,6 +133,16 @@ class OLPEngine:
         return event
 
     @staticmethod
+    def _get_account_path(event: OLPEvent, default_key: str) -> str:
+        """
+        Supports dynamic COA overrides on a per-brand / per-segment basis.
+        """
+        ctx = event.accounting_context
+        if ctx.coa_overrides and default_key in ctx.coa_overrides:
+            return ctx.coa_overrides[default_key]
+        return ACCOUNT_PATHS[default_key]
+
+    @staticmethod
     def _get_tax_account(event: OLPEvent) -> str:
         """
         Dynamically route local tax credits for MNC jurisdictions.
@@ -136,7 +150,7 @@ class OLPEngine:
         if event.tax_jurisdiction:
             clean_jurisdiction = event.tax_jurisdiction.lower().replace("-", "_")
             return f"/liabilities/tax/payable/{clean_jurisdiction}"
-        return ACCOUNT_PATHS["Sales Tax Payable"]
+        return OLPEngine._get_account_path(event, "Sales Tax Payable")
 
     @staticmethod
     def compile_event(event: OLPEvent) -> CompilationResult:
@@ -187,18 +201,16 @@ class OLPEngine:
             else:
                 res = OLPEngine._compile_agent_ot(event)
 
-        # Apply Intercompany Transfer (ASC 810) if partner entity is defined and different
+        # Apply Intercompany Transfer (ASC 810)
         if event.intercompany_entity_id and event.intercompany_entity_id != ctx.entity_id:
-            # 1. Update billing entity ledger (German ledger): debit intercompany expense, credit intercompany payable
             pay_acct = f"/liabilities/payables/intercompany_{event.intercompany_entity_id.lower()}"
             res.initial_transaction.entries.append(
-                LedgerEntry(account=ACCOUNT_PATHS["Intercompany Expense"], type="debit", amount=event.intercompany_transfer_amount)
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Intercompany Expense"), type="debit", amount=event.intercompany_transfer_amount)
             )
             res.initial_transaction.entries.append(
                 LedgerEntry(account=pay_acct, type="credit", amount=event.intercompany_transfer_amount)
             )
             
-            # 2. Build partner ledger transaction: debit intercompany receivable, credit intercompany revenue
             rec_acct = f"/assets/receivables/intercompany_{ctx.entity_id.lower()}"
             partner_tx = Transaction(
                 transaction_id=f"tx_ic_{uuid.uuid4().hex[:8]}",
@@ -206,13 +218,23 @@ class OLPEngine:
                 idempotency_key=f"{event.idempotency_key}_ic",
                 date=event.timestamp,
                 status="posted",
+                consolidation_type="elimination" if ctx.is_intercompany else "standard",
                 description=f"OLP Intercompany Revenue Transfer: {ctx.entity_id} to {event.intercompany_entity_id}",
                 entries=[
                     LedgerEntry(account=rec_acct, type="debit", amount=event.intercompany_transfer_amount),
-                    LedgerEntry(account=ACCOUNT_PATHS["Intercompany Revenue"], type="credit", amount=event.intercompany_transfer_amount)
+                    LedgerEntry(account=OLPEngine._get_account_path(event, "Intercompany Revenue"), type="credit", amount=event.intercompany_transfer_amount)
                 ]
             )
             res.intercompany_transaction = partner_tx
+
+        # Set consolidation tags (ASC 810 Consolidation Eliminations)
+        if ctx.is_intercompany:
+            res.initial_transaction.consolidation_type = "elimination"
+            if res.amortization_schedule:
+                for tx in res.amortization_schedule:
+                    tx.consolidation_type = "elimination"
+            if res.intercompany_transaction:
+                res.intercompany_transaction.consolidation_type = "elimination"
 
         return res
 
@@ -223,8 +245,8 @@ class OLPEngine:
         tax_acct = OLPEngine._get_tax_account(event)
         
         entries = [
-            LedgerEntry(account=ACCOUNT_PATHS["Order Clearing"], type="debit", amount=event.amount),
-            LedgerEntry(account=ACCOUNT_PATHS["Gross Revenue"], type="credit", amount=base_amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Order Clearing"), type="debit", amount=event.amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Gross Revenue"), type="credit", amount=base_amount),
             LedgerEntry(account=tax_acct, type="credit", amount=event.tax_amount)
         ]
         tx = Transaction(
@@ -244,9 +266,9 @@ class OLPEngine:
         net_amount = event.amount - event.processing_fee
         
         entries = [
-            LedgerEntry(account=ACCOUNT_PATHS["Payment Clearing"], type="debit", amount=net_amount),
-            LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee),
-            LedgerEntry(account=ACCOUNT_PATHS["Order Clearing"], type="credit", amount=event.amount)
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Clearing"), type="debit", amount=net_amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Processing Expense"), type="debit", amount=event.processing_fee),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Order Clearing"), type="credit", amount=event.amount)
         ]
         tx = Transaction(
             transaction_id=tx_id,
@@ -263,8 +285,8 @@ class OLPEngine:
     def _compile_payout_cleared(event: OLPEvent) -> CompilationResult:
         tx_id = f"tx_pay_{uuid.uuid4().hex[:8]}"
         entries = [
-            LedgerEntry(account=ACCOUNT_PATHS["Cash"], type="debit", amount=event.amount),
-            LedgerEntry(account=ACCOUNT_PATHS["Payment Clearing"], type="credit", amount=event.amount)
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Cash"), type="debit", amount=event.amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Clearing"), type="credit", amount=event.amount)
         ]
         tx = Transaction(
             transaction_id=tx_id,
@@ -286,17 +308,17 @@ class OLPEngine:
         debit_cash = target_amount - event.processing_fee
         
         entries = [
-            LedgerEntry(account=ACCOUNT_PATHS["Cash"], type="debit", amount=debit_cash),
-            LedgerEntry(account=ACCOUNT_PATHS["Accounts Receivable"], type="credit", amount=event.amount)
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Cash"), type="debit", amount=debit_cash),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Accounts Receivable"), type="credit", amount=event.amount)
         ]
         
         if event.processing_fee > 0:
-            entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
+            entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Processing Expense"), type="debit", amount=event.processing_fee))
             
         if fx_diff > 0:
-            entries.append(LedgerEntry(account=ACCOUNT_PATHS["Gain on FX"], type="credit", amount=fx_diff))
+            entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Gain on FX"), type="credit", amount=fx_diff))
         elif fx_diff < 0:
-            entries.append(LedgerEntry(account=ACCOUNT_PATHS["Loss on FX"], type="debit", amount=abs(fx_diff)))
+            entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Loss on FX"), type="debit", amount=abs(fx_diff)))
             
         tx = Transaction(
             transaction_id=tx_id,
@@ -317,8 +339,8 @@ class OLPEngine:
         tax_acct = OLPEngine._get_tax_account(event)
         
         entries = [
-            LedgerEntry(account=ACCOUNT_PATHS["Refunds & Allowances"], type="debit", amount=base_refund),
-            LedgerEntry(account=ACCOUNT_PATHS[credit_account], type="credit", amount=event.amount)
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Refunds & Allowances"), type="debit", amount=base_refund),
+            LedgerEntry(account=OLPEngine._get_account_path(event, credit_account), type="credit", amount=event.amount)
         ]
         
         if event.tax_amount > 0:
@@ -339,8 +361,8 @@ class OLPEngine:
     def _compile_goods_returned(event: OLPEvent, total_cogs: float) -> CompilationResult:
         tx_id = f"tx_return_{uuid.uuid4().hex[:8]}"
         entries = [
-            LedgerEntry(account=ACCOUNT_PATHS["Inventory"], type="debit", amount=total_cogs),
-            LedgerEntry(account=ACCOUNT_PATHS["Cost of Goods Sold"], type="credit", amount=total_cogs)
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Inventory"), type="debit", amount=total_cogs),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Cost of Goods Sold"), type="credit", amount=total_cogs)
         ]
         tx = Transaction(
             transaction_id=tx_id,
@@ -357,8 +379,8 @@ class OLPEngine:
     def _compile_contract_billed(event: OLPEvent) -> CompilationResult:
         tx_id = f"tx_billed_{uuid.uuid4().hex[:8]}"
         entries = [
-            LedgerEntry(account=ACCOUNT_PATHS["Accounts Receivable"], type="debit", amount=event.amount),
-            LedgerEntry(account=ACCOUNT_PATHS["Contract Assets"], type="credit", amount=event.amount)
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Accounts Receivable"), type="debit", amount=event.amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Contract Assets"), type="credit", amount=event.amount)
         ]
         tx = Transaction(
             transaction_id=tx_id,
@@ -375,8 +397,8 @@ class OLPEngine:
     def _compile_invoice_written_off(event: OLPEvent) -> CompilationResult:
         tx_id = f"tx_writeoff_{uuid.uuid4().hex[:8]}"
         entries = [
-            LedgerEntry(account=ACCOUNT_PATHS["Bad Debt Expense"], type="debit", amount=event.amount),
-            LedgerEntry(account=ACCOUNT_PATHS["Accounts Receivable"], type="credit", amount=event.amount)
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Bad Debt Expense"), type="debit", amount=event.amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Accounts Receivable"), type="credit", amount=event.amount)
         ]
         tx = Transaction(
             transaction_id=tx_id,
@@ -390,12 +412,13 @@ class OLPEngine:
         return CompilationResult(initial_transaction=tx)
 
     @staticmethod
-    def _get_debit_asset_account(ctx: AccountingContext) -> str:
+    def _get_debit_asset_account(event: OLPEvent) -> str:
+        ctx = event.accounting_context
         if ctx.payment_method == "invoice":
             if ctx.billing_status == "unbilled":
-                return ACCOUNT_PATHS["Contract Assets"]
-            return ACCOUNT_PATHS["Accounts Receivable"]
-        return ACCOUNT_PATHS["Cash"]
+                return OLPEngine._get_account_path(event, "Contract Assets")
+            return OLPEngine._get_account_path(event, "Accounts Receivable")
+        return OLPEngine._get_account_path(event, "Cash")
 
     @staticmethod
     def _compile_principal_pit(event: OLPEvent, total_cogs: float) -> CompilationResult:
@@ -405,43 +428,43 @@ class OLPEngine:
         tx_id = f"tx_pit_{uuid.uuid4().hex[:8]}"
         ctx = event.accounting_context
         
-        debit_account = OLPEngine._get_debit_asset_account(ctx)
+        debit_account = OLPEngine._get_debit_asset_account(event)
         base_amount = event.amount - event.tax_amount
         tax_acct = OLPEngine._get_tax_account(event)
         
         if event.event_type == "payment_received":
-            debit_cash = event.amount - event.processing_fee if debit_account == ACCOUNT_PATHS["Cash"] else event.amount
+            debit_cash = event.amount - event.processing_fee if debit_account == OLPEngine._get_account_path(event, "Cash") else event.amount
             entries = [
                 LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
-                LedgerEntry(account=ACCOUNT_PATHS["Deferred Revenue"], type="credit", amount=base_amount),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Revenue"), type="credit", amount=base_amount),
                 LedgerEntry(account=tax_acct, type="credit", amount=event.tax_amount)
             ]
-            if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
-                entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
+            if event.processing_fee > 0 and debit_account == OLPEngine._get_account_path(event, "Cash"):
+                entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Processing Expense"), type="debit", amount=event.processing_fee))
             desc = f"OLP Principal Payment Received (Deferred): {event.description}"
             
         elif event.event_type == "fulfillment_completed":
             entries = [
-                LedgerEntry(account=ACCOUNT_PATHS["Deferred Revenue"], type="debit", amount=base_amount),
-                LedgerEntry(account=ACCOUNT_PATHS["Gross Revenue"], type="credit", amount=base_amount)
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Revenue"), type="debit", amount=base_amount),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Gross Revenue"), type="credit", amount=base_amount)
             ]
             if total_cogs > 0:
-                entries.append(LedgerEntry(account=ACCOUNT_PATHS["Cost of Goods Sold"], type="debit", amount=total_cogs))
-                entries.append(LedgerEntry(account=ACCOUNT_PATHS["Inventory"], type="credit", amount=total_cogs))
+                entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Cost of Goods Sold"), type="debit", amount=total_cogs))
+                entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Inventory"), type="credit", amount=total_cogs))
             desc = f"OLP Principal Delivery / Fulfillment (Revenue Recognized): {event.description}"
             
         else: # immediate_sale
-            debit_cash = event.amount - event.processing_fee if debit_account == ACCOUNT_PATHS["Cash"] else event.amount
+            debit_cash = event.amount - event.processing_fee if debit_account == OLPEngine._get_account_path(event, "Cash") else event.amount
             entries = [
                 LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
-                LedgerEntry(account=ACCOUNT_PATHS["Gross Revenue"], type="credit", amount=base_amount),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Gross Revenue"), type="credit", amount=base_amount),
                 LedgerEntry(account=tax_acct, type="credit", amount=event.tax_amount)
             ]
-            if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
-                entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
+            if event.processing_fee > 0 and debit_account == OLPEngine._get_account_path(event, "Cash"):
+                entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Processing Expense"), type="debit", amount=event.processing_fee))
             if total_cogs > 0:
-                entries.append(LedgerEntry(account=ACCOUNT_PATHS["Cost of Goods Sold"], type="debit", amount=total_cogs))
-                entries.append(LedgerEntry(account=ACCOUNT_PATHS["Inventory"], type="credit", amount=total_cogs))
+                entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Cost of Goods Sold"), type="debit", amount=total_cogs))
+                entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Inventory"), type="credit", amount=total_cogs))
             desc = f"OLP Principal Immediate Sale booking for: {event.description}"
 
         tx = Transaction(
@@ -449,8 +472,8 @@ class OLPEngine:
             source_event_id=event.event_id,
             idempotency_key=event.idempotency_key,
             date=event.timestamp,
-            status="posted",
             description=desc,
+            status="posted",
             entries=entries
         )
         return CompilationResult(initial_transaction=tx)
@@ -462,25 +485,25 @@ class OLPEngine:
         """
         ctx = event.accounting_context
         term = ctx.term_months
-        debit_account = OLPEngine._get_debit_asset_account(ctx)
+        debit_account = OLPEngine._get_debit_asset_account(event)
         base_amount = event.amount - event.tax_amount
-        debit_cash = event.amount - event.processing_fee if debit_account == ACCOUNT_PATHS["Cash"] else event.amount
+        debit_cash = event.amount - event.processing_fee if debit_account == OLPEngine._get_account_path(event, "Cash") else event.amount
         tax_acct = OLPEngine._get_tax_account(event)
         
         # Initial booking transaction
         init_tx_id = f"tx_init_{uuid.uuid4().hex[:8]}"
         init_entries = [
             LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
-            LedgerEntry(account=ACCOUNT_PATHS["Deferred Revenue"], type="credit", amount=base_amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Revenue"), type="credit", amount=base_amount),
             LedgerEntry(account=tax_acct, type="credit", amount=event.tax_amount)
         ]
-        if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
-            init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
+        if event.processing_fee > 0 and debit_account == OLPEngine._get_account_path(event, "Cash"):
+            init_entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Processing Expense"), type="debit", amount=event.processing_fee))
             
         # Add Capitalized Commissions
         if event.capitalized_costs > 0:
-            init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Deferred Contract Costs"], type="debit", amount=event.capitalized_costs))
-            init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Commissions Payable"], type="credit", amount=event.capitalized_costs))
+            init_entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Contract Costs"), type="debit", amount=event.capitalized_costs))
+            init_entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Commissions Payable"), type="credit", amount=event.capitalized_costs))
 
         init_tx = Transaction(
             transaction_id=init_tx_id,
@@ -519,21 +542,21 @@ class OLPEngine:
 
             amort_tx_id = f"tx_amort_{i}_{uuid.uuid4().hex[:8]}"
             amort_entries = [
-                LedgerEntry(account=ACCOUNT_PATHS["Deferred Revenue"], type="debit", amount=current_monthly_rev),
-                LedgerEntry(account=ACCOUNT_PATHS["Subscription Revenue"], type="credit", amount=current_monthly_rev)
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Revenue"), type="debit", amount=current_monthly_rev),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Subscription Revenue"), type="credit", amount=current_monthly_rev)
             ]
             
             if event.capitalized_costs > 0:
-                amort_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Amortized Commission Expense"], type="debit", amount=current_monthly_cost))
-                amort_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Deferred Contract Costs"], type="credit", amount=current_monthly_cost))
+                amort_entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Amortized Commission Expense"), type="debit", amount=current_monthly_cost))
+                amort_entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Contract Costs"), type="credit", amount=current_monthly_cost))
 
             amort_tx = Transaction(
                 transaction_id=amort_tx_id,
                 source_event_id=event.event_id,
                 idempotency_key=event.idempotency_key,
                 date=amort_date,
-                status="posted",
                 description=f"OLP Amortization Month {i}/{term} for: {event.description}",
+                status="posted",
                 entries=amort_entries
             )
             amort_txs.append(amort_tx)
@@ -546,8 +569,8 @@ class OLPEngine:
         Rule C: Agent + Physical/Digital + Point-in-Time (In Cents)
         """
         ctx = event.accounting_context
-        debit_account = OLPEngine._get_debit_asset_account(ctx)
-        debit_cash = event.amount - event.processing_fee if debit_account == ACCOUNT_PATHS["Cash"] else event.amount
+        debit_account = OLPEngine._get_debit_asset_account(event)
+        debit_cash = event.amount - event.processing_fee if debit_account == OLPEngine._get_account_path(event, "Cash") else event.amount
         
         base_amount = event.amount - event.tax_amount
         commission = int(base_amount * ctx.platform_fee_percent)
@@ -559,32 +582,32 @@ class OLPEngine:
         if event.event_type == "payment_received":
             entries = [
                 LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
-                LedgerEntry(account=ACCOUNT_PATHS["Deferred Payable (Vendor)"], type="credit", amount=vendor_cut),
-                LedgerEntry(account=ACCOUNT_PATHS["Deferred Commission Revenue"], type="credit", amount=commission),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Payable (Vendor)"), type="credit", amount=vendor_cut),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Commission Revenue"), type="credit", amount=commission),
                 LedgerEntry(account=tax_acct, type="credit", amount=event.tax_amount)
             ]
-            if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
-                entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
+            if event.processing_fee > 0 and debit_account == OLPEngine._get_account_path(event, "Cash"):
+                entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Processing Expense"), type="debit", amount=event.processing_fee))
             desc = f"OLP Agent Payment Received (Deferred): {event.description}"
             
         elif event.event_type == "fulfillment_completed":
             entries = [
-                LedgerEntry(account=ACCOUNT_PATHS["Deferred Payable (Vendor)"], type="debit", amount=vendor_cut),
-                LedgerEntry(account=ACCOUNT_PATHS["Accounts Payable (Vendor)"], type="credit", amount=vendor_cut),
-                LedgerEntry(account=ACCOUNT_PATHS["Deferred Commission Revenue"], type="debit", amount=commission),
-                LedgerEntry(account=ACCOUNT_PATHS["Commission Revenue"], type="credit", amount=commission)
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Payable (Vendor)"), type="debit", amount=vendor_cut),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Accounts Payable (Vendor)"), type="credit", amount=vendor_cut),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Commission Revenue"), type="debit", amount=commission),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Commission Revenue"), type="credit", amount=commission)
             ]
             desc = f"OLP Agent Fulfillment (Revenue & Payable Recognized): {event.description}"
             
         else: # immediate_sale
             entries = [
                 LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
-                LedgerEntry(account=ACCOUNT_PATHS["Accounts Payable (Vendor)"], type="credit", amount=vendor_cut),
-                LedgerEntry(account=ACCOUNT_PATHS["Commission Revenue"], type="credit", amount=commission),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Accounts Payable (Vendor)"), type="credit", amount=vendor_cut),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Commission Revenue"), type="credit", amount=commission),
                 LedgerEntry(account=tax_acct, type="credit", amount=event.tax_amount)
             ]
-            if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
-                entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
+            if event.processing_fee > 0 and debit_account == OLPEngine._get_account_path(event, "Cash"):
+                entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Processing Expense"), type="debit", amount=event.processing_fee))
             desc = f"OLP Agent Immediate Sale booking for: {event.description}"
         
         tx = Transaction(
@@ -592,7 +615,6 @@ class OLPEngine:
             source_event_id=event.event_id,
             idempotency_key=event.idempotency_key,
             date=event.timestamp,
-            status="posted",
             description=desc,
             entries=entries
         )
@@ -605,8 +627,8 @@ class OLPEngine:
         """
         ctx = event.accounting_context
         term = ctx.term_months
-        debit_account = OLPEngine._get_debit_asset_account(ctx)
-        debit_cash = event.amount - event.processing_fee if debit_account == ACCOUNT_PATHS["Cash"] else event.amount
+        debit_account = OLPEngine._get_debit_asset_account(event)
+        debit_cash = event.amount - event.processing_fee if debit_account == OLPEngine._get_account_path(event, "Cash") else event.amount
         
         base_amount = event.amount - event.tax_amount
         commission = int(base_amount * ctx.platform_fee_percent)
@@ -617,19 +639,18 @@ class OLPEngine:
         init_tx_id = f"tx_agent_init_{uuid.uuid4().hex[:8]}"
         init_entries = [
             LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
-            LedgerEntry(account=ACCOUNT_PATHS["Deferred Payable (Vendor)"], type="credit", amount=vendor_cut),
-            LedgerEntry(account=ACCOUNT_PATHS["Deferred Commission Revenue"], type="credit", amount=commission),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Payable (Vendor)"), type="credit", amount=vendor_cut),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Commission Revenue"), type="credit", amount=commission),
             LedgerEntry(account=tax_acct, type="credit", amount=event.tax_amount)
         ]
-        if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
-            init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
+        if event.processing_fee > 0 and debit_account == OLPEngine._get_account_path(event, "Cash"):
+            init_entries.append(LedgerEntry(account=OLPEngine._get_account_path(event, "Payment Processing Expense"), type="debit", amount=event.processing_fee))
             
         init_tx = Transaction(
             transaction_id=init_tx_id,
             source_event_id=event.event_id,
             idempotency_key=event.idempotency_key,
             date=event.timestamp,
-            status="posted",
             description=f"OLP Agent Initial Over-Time booking for: {event.description}",
             entries=init_entries
         )
@@ -661,10 +682,10 @@ class OLPEngine:
 
             amort_tx_id = f"tx_agent_amort_{i}_{uuid.uuid4().hex[:8]}"
             amort_entries = [
-                LedgerEntry(account=ACCOUNT_PATHS["Deferred Payable (Vendor)"], type="debit", amount=curr_vendor),
-                LedgerEntry(account=ACCOUNT_PATHS["Accounts Payable (Vendor)"], type="credit", amount=curr_vendor),
-                LedgerEntry(account=ACCOUNT_PATHS["Deferred Commission Revenue"], type="debit", amount=curr_comm),
-                LedgerEntry(account=ACCOUNT_PATHS["Commission Revenue"], type="credit", amount=curr_comm)
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Payable (Vendor)"), type="debit", amount=curr_vendor),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Accounts Payable (Vendor)"), type="credit", amount=curr_vendor),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Deferred Commission Revenue"), type="debit", amount=curr_comm),
+                LedgerEntry(account=OLPEngine._get_account_path(event, "Commission Revenue"), type="credit", amount=curr_comm)
             ]
             
             amort_tx = Transaction(
@@ -672,7 +693,6 @@ class OLPEngine:
                 source_event_id=event.event_id,
                 idempotency_key=event.idempotency_key,
                 date=amort_date,
-                status="posted",
                 description=f"OLP Agent Amortization Month {i}/{term} for: {event.description}",
                 entries=amort_entries
             )

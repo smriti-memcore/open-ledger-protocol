@@ -462,21 +462,14 @@ class TestOLPEngine(unittest.TestCase):
         self.assertEqual(debits_p[ACCOUNT_PATHS["Cash"]], 10480)
         self.assertEqual(credits_p[ACCOUNT_PATHS["Payment Clearing"]], 10480)
 
-    # =========================================================================
-    # MULTINATIONAL CORPORATION & TAX JURISDICTION TESTS (PHASE 6)
-    # =========================================================================
-
     def test_multinational_tax_jurisdictions(self):
-        """
-        Verify localized tax accounting splits.
-        """
         event = OLPEvent(
             event_id="evt_de_sale",
             idempotency_key="idemp_de_sale",
             timestamp="2026-07-16T12:00:00Z",
-            amount=11900, # €119.00 inclusive of tax
-            tax_amount=1900, # German VAT 19%
-            tax_jurisdiction="DE", # Dynamic localization
+            amount=11900,
+            tax_amount=1900,
+            tax_jurisdiction="DE",
             currency="EUR",
             description="Sale to German client",
             customer_id="cust_helmut",
@@ -493,17 +486,10 @@ class TestOLPEngine(unittest.TestCase):
         
         credits = {e.account: e.amount for e in tx.entries if e.type == "credit"}
         
-        # Verify that tax hits the German-specific tax liability path
         self.assertEqual(credits["/liabilities/tax/payable/de"], 1900)
         self.assertEqual(credits[ACCOUNT_PATHS["Gross Revenue"]], 10000)
 
     def test_intercompany_transfer_pricing(self):
-        """
-        ASC 810 Compliance: Acme Germany books a sale for €100.00 base, but
-        infrastructure is hosted by Acme US.
-        German ledger books an intercompany expense of €85.00 (8500 cents) and intercompany payable.
-        US ledger books intercompany receivable of €85.00 and intercompany revenue.
-        """
         event = OLPEvent(
             event_id="evt_cross_border",
             idempotency_key="idemp_cross_border",
@@ -514,8 +500,8 @@ class TestOLPEngine(unittest.TestCase):
             currency="EUR",
             description="Acme Germany sells, Acme US fulfills",
             customer_id="cust_helmut",
-            intercompany_entity_id="acme_us", # Parent fulfiller
-            intercompany_transfer_amount=8500, # transfer pricing fee
+            intercompany_entity_id="acme_us",
+            intercompany_transfer_amount=8500,
             accounting_context=AccountingContext(
                 entity_id="acme_de",
                 role="principal",
@@ -525,7 +511,6 @@ class TestOLPEngine(unittest.TestCase):
         )
         result = OLPEngine.compile_event(event)
         
-        # 1. Verify German ledger
         tx_de = result.initial_transaction
         self.assertTrue(tx_de.is_balanced())
         debits_de = {e.account: e.amount for e in tx_de.entries if e.type == "debit"}
@@ -534,7 +519,6 @@ class TestOLPEngine(unittest.TestCase):
         self.assertEqual(debits_de[ACCOUNT_PATHS["Intercompany Expense"]], 8500)
         self.assertEqual(credits_de["/liabilities/payables/intercompany_acme_us"], 8500)
 
-        # 2. Verify US ledger
         tx_us = result.intercompany_transaction
         self.assertIsNotNone(tx_us)
         self.assertTrue(tx_us.is_balanced())
@@ -544,6 +528,81 @@ class TestOLPEngine(unittest.TestCase):
         
         self.assertEqual(debits_us["/assets/receivables/intercompany_acme_de"], 8500)
         self.assertEqual(credits_us[ACCOUNT_PATHS["Intercompany Revenue"]], 8500)
+
+    # =========================================================================
+    # DIVISIONAL SEGMENT & COA OVERRIDE TESTS (PHASE 7)
+    # =========================================================================
+
+    def test_operating_segment_and_consolidation_elimination(self):
+        """
+        ASC 280 / ASC 810: AWS bills Twitch internally.
+        Resulting ledger transactions must be marked as 'elimination' to avoid double-counting.
+        """
+        event = OLPEvent(
+            event_id="evt_internal_aws_bill",
+            idempotency_key="idemp_internal_123",
+            timestamp="2026-07-16T12:00:00Z",
+            amount=50000,
+            currency="USD",
+            description="AWS cloud compute hosting invoice for Twitch",
+            customer_id="cust_twitch_corp",
+            intercompany_entity_id="twitch_corp",
+            intercompany_transfer_amount=50000,
+            accounting_context=AccountingContext(
+                entity_id="aws_corp",
+                segment_id="aws", # Segmenting
+                is_intercompany=True, # Elimination trigger
+                role="principal",
+                product_type="digital_download",
+                recognition="point_in_time"
+            )
+        )
+        result = OLPEngine.compile_event(event)
+        
+        tx_primary = result.initial_transaction
+        tx_ic = result.intercompany_transaction
+        
+        self.assertTrue(tx_primary.is_balanced())
+        self.assertTrue(tx_ic.is_balanced())
+        
+        # Verify consolidation tag is elimination on both ledgers
+        self.assertEqual(tx_primary.consolidation_type, "elimination")
+        self.assertEqual(tx_ic.consolidation_type, "elimination")
+
+    def test_dynamic_chart_of_accounts_overrides(self):
+        """
+        Audible overrides the 'Subscription Revenue' path.
+        """
+        event = OLPEvent(
+            event_id="evt_audible_sub",
+            idempotency_key="idemp_audible_998",
+            timestamp="2026-07-16T12:00:00Z",
+            amount=1500, # $15.00
+            currency="USD",
+            description="Audible Monthly Subscription",
+            customer_id="cust_listener",
+            accounting_context=AccountingContext(
+                entity_id="audible_inc",
+                segment_id="audible",
+                role="principal",
+                product_type="digital_saas",
+                recognition="over_time",
+                term_months=1,
+                coa_overrides={
+                    "Subscription Revenue": "/equity/revenue/audio_subscriptions"
+                }
+            )
+        )
+        result = OLPEngine.compile_event(event)
+        
+        # Check amortization schedule records override path
+        self.assertEqual(len(result.amortization_schedule), 1)
+        amort_tx = result.amortization_schedule[0]
+        self.assertTrue(amort_tx.is_balanced())
+        
+        credits = {e.account: e.amount for e in amort_tx.entries if e.type == "credit"}
+        self.assertIn("/equity/revenue/audio_subscriptions", credits)
+        self.assertEqual(credits["/equity/revenue/audio_subscriptions"], 1500)
 
     def test_validation_errors(self):
         with self.assertRaises(ValueError):
