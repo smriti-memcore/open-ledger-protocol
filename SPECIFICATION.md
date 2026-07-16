@@ -1,5 +1,5 @@
 # Open Ledger Protocol (OLP) Specification
-**Version 2.0.0-draft**
+**Version 3.0.0-draft**
 
 The **Open Ledger Protocol (OLP)** defines a standardized, metadata-driven system for financial accounting integrations. By decoupling business event creation from ledger compilation, OLP allows commerce/checkout platforms to send generic transaction events, which are dynamically mapped to double-entry ledger entries.
 
@@ -21,20 +21,24 @@ Every OLP-compliant payload contains an `accounting_context` block. This block a
 
 ## 2. Event Payload Schema
 
-A standard OLP event payload contains transactional details, the metadata routing headers, and optional financial adjustments (discounts, taxes, processing fees).
+A standard OLP event payload contains transactional details, metadata routing headers, a required idempotency key, and monetary adjustments. 
+
+> [!IMPORTANT]
+> **Minor Currency Units (Integers)**: All money values in OLP v3 must be represented as integers in their minor currency units (e.g., $120.00 is represented as `12000` cents). This eliminates floating-point rounding errors.
 
 ```json
 {
   "event_id": "evt_100293",
   "event_type": "payment_received", // ["payment_received" | "fulfillment_completed" | "immediate_sale" | "payment_settled" | "refund_issued" | "goods_returned"]
   "timestamp": "2026-07-16T08:00:00Z",
-  "amount": 120.00,                 // Gross amount collected from customer (inclusive of tax)
+  "idempotency_key": "idemp-9a8b7c6d-5e4f-3a2b", // Required to prevent double-posting
+  "amount": 12000,                  // Gross amount in cents (inclusive of tax)
   "currency": "USD",
   "description": "Premium Subscription Annual Plan",
   "customer_id": "cust_8829",
-  "tax_amount": 10.00,              // Taxes included in the amount (Sales Tax / VAT)
-  "processing_fee": 3.80,           // Merchant gateway transaction charges
-  "discount_amount": 20.00,         // Transaction-level discount to distribute
+  "tax_amount": 1000,               // Taxes included in the amount ($10.00 represented as 1000)
+  "processing_fee": 380,            // Merchant gateway fee ($3.80 represented as 380)
+  "discount_amount": 2000,          // Transaction discount ($20.00 represented as 2000)
   "accounting_context": {
     "role": "principal",
     "product_type": "digital_saas",
@@ -45,8 +49,8 @@ A standard OLP event payload contains transactional details, the metadata routin
   "line_items": [
     {
       "item_id": "prod_premium_annual",
-      "price": 120.00,
-      "cogs_estimate": 0.00
+      "price": 12000,
+      "cogs_estimate": 0
     }
   ]
 }
@@ -54,7 +58,30 @@ A standard OLP event payload contains transactional details, the metadata routin
 
 ---
 
-## 3. Compiled Ledger Output Schema
+## 3. Account Hierarchies (Chart of Accounts)
+
+In OLP v3, flat account names are replaced by standardized hierarchical paths. This enables seamless integration with ledger engines like Twisp and Fragment that compile parent-child balances.
+
+| Standard Accounting Term | OLP v3 Standardized Account Path |
+| :--- | :--- |
+| **Cash** | `/assets/liquid/cash` |
+| **Accounts Receivable** | `/assets/receivables/ar` |
+| **Inventory** | `/assets/inventory` |
+| **Deferred Revenue** | `/liabilities/deferred/revenue` |
+| **Deferred Payable (Vendor)** | `/liabilities/deferred/payable_vendor` |
+| **Deferred Commission Revenue**| `/liabilities/deferred/commission` |
+| **Accounts Payable (Vendor)** | `/liabilities/payables/vendor` |
+| **Sales Tax Payable** | `/liabilities/tax/payable` |
+| **Gross Revenue** | `/equity/revenue/gross` |
+| **Subscription Revenue** | `/equity/revenue/subscription` |
+| **Commission Revenue** | `/equity/revenue/commission` |
+| **Refunds & Allowances** | `/equity/revenue/refunds_allowances` |
+| **Payment Processing Expense** | `/expenses/processing/fees` |
+| **Cost of Goods Sold** | `/expenses/cogs` |
+
+---
+
+## 4. Compiled Ledger Output Schema
 
 A transaction compiled by the OLP engine must satisfy double-entry requirements: **total debits must exactly equal total credits.**
 
@@ -63,28 +90,30 @@ A transaction compiled by the OLP engine must satisfy double-entry requirements:
 {
   "transaction_id": "tx_abc123",
   "source_event_id": "evt_100293",
+  "idempotency_key": "idemp-9a8b7c6d-5e4f-3a2b",
   "date": "2026-07-16T08:00:00Z",
+  "status": "posted",               // ["pending" | "posted"]
   "description": "Compiled OLP Transaction: Premium Subscription Annual Plan",
   "entries": [
     {
-      "account": "Cash",
+      "account": "/assets/liquid/cash",
       "type": "debit",
-      "amount": 116.20
+      "amount": 11620               // Net cash debited ($116.20)
     },
     {
-      "account": "Payment Processing Expense",
+      "account": "/expenses/processing/fees",
       "type": "debit",
-      "amount": 3.80
+      "amount": 380                 // Processing fee ($3.80)
     },
     {
-      "account": "Deferred Revenue",
+      "account": "/liabilities/deferred/revenue",
       "type": "credit",
-      "amount": 110.00
+      "amount": 11000               // Base liability ($110.00)
     },
     {
-      "account": "Sales Tax Payable",
+      "account": "/liabilities/tax/payable",
       "type": "credit",
-      "amount": 10.00
+      "amount": 1000                // Tax liability ($10.00)
     }
   ]
 }
@@ -92,83 +121,50 @@ A transaction compiled by the OLP engine must satisfy double-entry requirements:
 
 ---
 
-## 4. Compilation Matrix & Core Rules
+## 5. Compilation Rules & Double-Entry Math (In Cents)
 
-The OLP compilation engine routes the event payload based on the `accounting_context` values.
+The engine routes the event payload based on the `accounting_context` values and performs all arithmetic using integers.
 
-### Rule A: Principal + Physical + Point-in-Time
-* **Accounting Treatment:** Recognize gross revenue immediately (adjusted for tax). Adjust inventory/COGS immediately.
-* **Entries (Immediate Sale):**
-  1. `Debit: Cash` (Gross Amount - Processing Fee)
-  2. `Debit: Payment Processing Expense` (Processing Fee)
-  3. `Credit: Gross Revenue` (Gross Amount - Tax Amount)
-  4. `Credit: Sales Tax Payable` (Tax Amount)
-  5. `Debit: Cost of Goods Sold` (COGS Estimate)
-  6. `Credit: Inventory` (COGS Estimate)
+### Rule A: Principal + Physical + Point-in-Time (Immediate Sale)
+1. `Debit: /assets/liquid/cash` (Gross Amount - Processing Fee) *[Skip fee if payment method is invoice]*
+2. `Debit: /expenses/processing/fees` (Processing Fee) *[Skip fee if payment method is invoice]*
+3. `Credit: /equity/revenue/gross` (Gross Amount - Tax Amount)
+4. `Credit: /liabilities/tax/payable` (Tax Amount)
+5. `Debit: /expenses/cogs` (COGS Estimate)
+6. `Credit: /assets/inventory` (COGS Estimate)
 
-### Rule B: Principal + Digital/SaaS + Over-Time
-* **Accounting Treatment:** Recognize initial cash and deferred liability (adjusted for tax). Amortize revenue ratably.
-* **Entries (Initial booking):**
-  1. `Debit: Cash` (Gross Amount - Processing Fee)
-  2. `Debit: Payment Processing Expense` (Processing Fee)
-  3. `Credit: Deferred Revenue` (Gross Amount - Tax Amount)
-  4. `Credit: Sales Tax Payable` (Tax Amount)
-* **Entries (Amortization schedule):**
-  * Generate $N$ monthly schedules where monthly amount = $\frac{\text{Gross Amount} - \text{Tax Amount}}{\text{term\_months}}$:
-    1. `Debit: Deferred Revenue` (Monthly Amount)
-    2. `Credit: Subscription Revenue` (Monthly Amount)
+### Rule B: Principal + Digital/SaaS + Over-Time (Initial Booking)
+1. `Debit: /assets/liquid/cash` (Gross Amount - Processing Fee)
+2. `Debit: /expenses/processing/fees` (Processing Fee)
+3. `Credit: /liabilities/deferred/revenue` (Gross Amount - Tax Amount)
+4. `Credit: /liabilities/tax/payable` (Tax Amount)
+* **Amortization (per month)**: Monthly amount = `(Gross Amount - Tax Amount) // term_months`. The last month receives the remainder of the integer division division to prevent losing precision cents.
+  1. `Debit: /liabilities/deferred/revenue` (Monthly Cents)
+  2. `Credit: /equity/revenue/subscription` (Monthly Cents)
 
-### Rule C: Agent + Physical + Point-in-Time
-* **Accounting Treatment:** Recognize net commission immediately (adjusted for tax), and hold vendor payout.
-* **Calculations:**
+### Rule C: Agent + Physical + Point-in-Time (Immediate Sale)
+* **Calculations**:
   * Base Price = Gross Amount - Tax Amount
-  * Commission = Base Price * Platform Cut %
+  * Commission = `(Base Price * Platform Cut %) // 100` (computed as integer math)
   * Vendor Cut = Base Price - Commission
-* **Entries (Immediate Sale):**
-  1. `Debit: Cash` (Gross Amount - Processing Fee)
-  2. `Debit: Payment Processing Expense` (Processing Fee)
-  3. `Credit: Accounts Payable (Vendor)` (Vendor Cut)
-  4. `Credit: Commission Revenue` (Commission)
-  5. `Credit: Sales Tax Payable` (Tax Amount)
+* **Entries**:
+  1. `Debit: /assets/liquid/cash` (Gross Amount - Processing Fee)
+  2. `Debit: /expenses/processing/fees` (Processing Fee)
+  3. `Credit: /liabilities/payables/vendor` (Vendor Cut)
+  4. `Credit: /equity/revenue/commission` (Commission)
+  5. `Credit: /liabilities/tax/payable` (Tax Amount)
 
-### Rule D: Agent + Digital/SaaS + Over-Time
-* **Accounting Treatment:** Recognize cash, track deferred vendor payable and deferred commission, and amortize over time.
-* **Calculations:**
-  * Base Price = Gross Amount - Tax Amount
-  * Commission = Base Price * Platform Cut %
-  * Vendor Cut = Base Price - Commission
-* **Entries (Initial booking):**
-  1. `Debit: Cash` (Gross Amount - Processing Fee)
-  2. `Debit: Payment Processing Expense` (Processing Fee)
-  3. `Credit: Deferred Payable (Vendor)` (Vendor Cut)
-  4. `Credit: Deferred Commission Revenue` (Commission)
-  5. `Credit: Sales Tax Payable` (Tax Amount)
-* **Entries (Amortization schedule):**
-  * Generate $N$ monthly schedules:
-    1. `Debit: Deferred Payable (Vendor)` (Monthly Vendor Cut)
-    2. `Credit: Accounts Payable (Vendor)` (Monthly Vendor Cut)
-    3. `Debit: Deferred Commission Revenue` (Monthly Platform Cut)
-    4. `Credit: Commission Revenue` (Monthly Platform Cut)
-
----
-
-## 5. Fulfillment Lifecycles & Delivery
-
-For point-in-time transactions where payment and delivery occur at different times:
-
-### A. Phase 1: `payment_received` (No transfer of control yet)
-* **Entries:**
-  1. `Debit: Cash` (Gross Amount - Processing Fee)
-  2. `Debit: Payment Processing Expense` (Processing Fee)
-  3. `Credit: Deferred Revenue` (Gross Amount - Tax Amount)
-  4. `Credit: Sales Tax Payable` (Tax Amount)
-
-### B. Phase 2: `fulfillment_completed` (Control transfers to customer)
-* **Entries:**
-  1. `Debit: Deferred Revenue` (Gross Amount - Tax Amount)
-  2. `Credit: Gross Revenue` (Gross Amount - Tax Amount)
-  3. `Debit: Cost of Goods Sold` (COGS Estimate)
-  4. `Credit: Inventory` (COGS Estimate)
+### Rule D: Agent + Digital/SaaS + Over-Time (Initial Booking)
+1. `Debit: /assets/liquid/cash` (Gross Amount - Processing Fee)
+2. `Debit: /expenses/processing/fees` (Processing Fee)
+3. `Credit: /liabilities/deferred/payable_vendor` (Vendor Cut)
+4. `Credit: /liabilities/deferred/commission` (Commission)
+5. `Credit: /liabilities/tax/payable` (Tax Amount)
+* **Amortization (per month)**:
+  1. `Debit: /liabilities/deferred/payable_vendor` (Monthly Vendor Cents)
+  2. `Credit: /liabilities/payables/vendor` (Monthly Vendor Cents)
+  3. `Debit: /liabilities/deferred/commission` (Monthly Commission Cents)
+  4. `Credit: /equity/revenue/commission` (Monthly Commission Cents)
 
 ---
 
@@ -177,26 +173,27 @@ For point-in-time transactions where payment and delivery occur at different tim
 ### A. Accounts Receivable (AR) Invoicing Lifecycle
 If `payment_method` is `"invoice"`, the Day 1 purchase event debits `Accounts Receivable` instead of `Cash` and bypasses the `processing_fee` (which is typically zero or charged later).
 * **Initial booking (Day 1 invoice):**
-  * `Debit: Accounts Receivable` (Gross Amount)
-  * `Credit: Deferred/Gross Revenue` (Base Price)
-  * `Credit: Sales Tax Payable` (Tax Amount)
+  * `Debit: /assets/receivables/ar` (Gross Amount)
+  * `Credit: /equity/revenue/gross` (Base Price)
+  * `Credit: /liabilities/tax/payable` (Tax Amount)
 * **Subsequent collection event (`"payment_settled"`):**
-  * `Debit: Cash` (Gross Amount - Processing Fee)
-  * `Debit: Payment Processing Expense` (Processing Fee)
-  * `Credit: Accounts Receivable` (Gross Amount)
+  * `Debit: /assets/liquid/cash` (Gross Amount - Processing Fee)
+  * `Debit: /expenses/processing/fees` (Processing Fee)
+  * `Credit: /assets/receivables/ar` (Gross Amount)
 
 ### B. Refunds and Inventory Returns
 * **Event `"refund_issued"`**:
   * Records customer refund using a GAAP contra-revenue account rather than deleting transactions.
-  * `Debit: Refunds & Allowances` (Base Price)
-  * `Debit: Sales Tax Payable` (Tax Amount)
-  * `Credit: Cash` (or `Accounts Receivable` if outstanding)
+  * `Debit: /equity/revenue/refunds_allowances` (Base Price)
+  * `Debit: /liabilities/tax/payable` (Tax Amount)
+  * `Credit: /assets/liquid/cash` (Gross Amount) *[Or credit `/assets/receivables/ar` if payment method is invoice]*
 * **Event `"goods_returned"`**:
   * Reverses cost of goods sold and restores physical inventory to stock.
-  * `Debit: Inventory` (Original COGS)
-  * `Credit: Cost of Goods Sold` (Original COGS)
+  * `Debit: /assets/inventory` (Original COGS Cents)
+  * `Credit: /expenses/cogs` (Original COGS Cents)
 
 ### C. Proportional Discount Allocations (ASC 606 Step 3)
 If a transaction-level `discount_amount` is provided, the compiler must distribute it proportionally across all line items based on their standalone pricing weights before applying recognition rules.
 * **Formula**:
   $$\text{Net Price}_i = \text{Price}_i - \left( \text{Discount} \times \frac{\text{Price}_i}{\sum \text{Price}} \right)$$
+  *(Using integer-division checks to guarantee the sum of discounts exactly matches `discount_amount`)*
