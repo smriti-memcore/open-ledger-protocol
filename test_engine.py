@@ -591,16 +591,7 @@ class TestOLPEngine(unittest.TestCase):
         self.assertIn("/equity/revenue/audio_subscriptions", credits)
         self.assertEqual(credits["/equity/revenue/audio_subscriptions"], 1500)
 
-    # =========================================================================
-    # ADVANCED RETAIL COMMERCE TESTS (PHASE 8)
-    # =========================================================================
-
     def test_line_item_context_overrides_bundle(self):
-        """
-        ASC 606 Step 4 Bundle: Kindle Device ($100.00 / 10000c, point_in_time)
-        + Audible Subscription ($50.00 / 5000c, 5-month over_time).
-        Taxes and processing fees must be allocated proportionally.
-        """
         device_ctx = AccountingContext(
             role="principal",
             product_type="physical",
@@ -617,16 +608,16 @@ class TestOLPEngine(unittest.TestCase):
             event_id="evt_bundle_pos",
             idempotency_key="idemp_bundle_pos",
             timestamp="2026-07-16T12:00:00Z",
-            amount=16500, # $150.00 price + $15.00 sales tax
+            amount=16500,
             tax_amount=1500,
-            processing_fee=450, # $4.50 card processor fee
+            processing_fee=450,
             currency="USD",
             description="Kindle + Subscription Bundle Checkout",
             customer_id="cust_reader",
-            accounting_context=device_ctx, # Default global context
+            accounting_context=device_ctx,
             line_items=[
-                LineItem(item_id="kindle_device", price=10000, cogs_estimate=3000), # uses default physical point-in-time
-                LineItem(item_id="kindle_unlimited_sub", price=5000, accounting_context=sub_ctx) # overrides with over-time SaaS
+                LineItem(item_id="kindle_device", price=10000, cogs_estimate=3000),
+                LineItem(item_id="kindle_unlimited_sub", price=5000, accounting_context=sub_ctx)
             ]
         )
         
@@ -637,22 +628,12 @@ class TestOLPEngine(unittest.TestCase):
         debits = {e.account: e.amount for e in init_tx.entries if e.type == "debit"}
         credits = {e.account: e.amount for e in init_tx.entries if e.type == "credit"}
         
-        # Verify split of cash and processing fee:
-        # Cash total debited = 16500 - 450 = 16050
         self.assertEqual(debits[ACCOUNT_PATHS["Cash"]], 16050)
         self.assertEqual(debits[ACCOUNT_PATHS["Payment Processing Expense"]], 450)
-        
-        # Verify splits of revenue:
-        # Device immediate recognized: $100.00
         self.assertEqual(credits[ACCOUNT_PATHS["Gross Revenue"]], 10000)
-        # Sub deferred: $50.00
         self.assertEqual(credits[ACCOUNT_PATHS["Deferred Revenue"]], 5000)
-        
-        # Verify splits of COGS:
-        # Device immediate COGS: $30.00
         self.assertEqual(debits[ACCOUNT_PATHS["Cost of Goods Sold"]], 3000)
 
-        # Verify Sub Amortization schedule (5 months at $10.00 each)
         self.assertEqual(len(result.amortization_schedule), 5)
         for tx in result.amortization_schedule:
             self.assertTrue(tx.is_balanced())
@@ -662,12 +643,6 @@ class TestOLPEngine(unittest.TestCase):
             self.assertEqual(creds[ACCOUNT_PATHS["Subscription Revenue"]], 1000)
 
     def test_sales_returns_reserves(self):
-        """
-        ASC 606 expected returns reserve: 3% return rate expected (300 bps)
-        Gross item price = $100.00 (10000 cents). COGS = $40.00 (4000 cents).
-        Gross Revenue = $97.00. Refund Reserve = $3.00.
-        Net COGS = $38.80 (3880 cents). Right to Recover = $1.20 (120 cents).
-        """
         event = OLPEvent(
             event_id="evt_reserve_pos",
             idempotency_key="idemp_reserve_pos",
@@ -676,7 +651,7 @@ class TestOLPEngine(unittest.TestCase):
             currency="USD",
             description="Book sale with expected 3% returns reserve",
             customer_id="cust_student",
-            expected_return_rate_basis_points=300, # 3.00% expected returns
+            expected_return_rate_basis_points=300,
             accounting_context=AccountingContext(
                 role="principal",
                 product_type="physical",
@@ -695,7 +670,6 @@ class TestOLPEngine(unittest.TestCase):
         
         self.assertEqual(credits[ACCOUNT_PATHS["Gross Revenue"]], 9700)
         self.assertEqual(credits[ACCOUNT_PATHS["Refund Reserve"]], 300)
-        
         self.assertEqual(debits[ACCOUNT_PATHS["Cost of Goods Sold"]], 3880)
         self.assertEqual(debits[ACCOUNT_PATHS["Right to Recover"]], 120)
         self.assertEqual(credits[ACCOUNT_PATHS["Inventory"]], 4000)
@@ -707,7 +681,6 @@ class TestOLPEngine(unittest.TestCase):
             recognition="point_in_time"
         )
         
-        # 1. Purchase $100 Gift card with a $3.00 fee
         buy_event = OLPEvent(
             event_id="gc_buy_1",
             idempotency_key="idemp_gc_buy_1",
@@ -731,7 +704,6 @@ class TestOLPEngine(unittest.TestCase):
         self.assertEqual(debits_b[ACCOUNT_PATHS["Payment Processing Expense"]], 300)
         self.assertEqual(credits_b[ACCOUNT_PATHS["Gift Card Liability"]], 10000)
 
-        # 2. Redeem $40 of the Gift Card
         redeem_event = OLPEvent(
             event_id="gc_red_1",
             idempotency_key="idemp_gc_red_1",
@@ -753,7 +725,6 @@ class TestOLPEngine(unittest.TestCase):
         self.assertEqual(debits_r[ACCOUNT_PATHS["Gift Card Liability"]], 4000)
         self.assertEqual(credits_r[ACCOUNT_PATHS["Gross Revenue"]], 4000)
 
-        # 3. Recognize $10 of unredeemed gift card breakage
         breakage_event = OLPEvent(
             event_id="gc_brk_1",
             idempotency_key="idemp_gc_brk_1",
@@ -774,6 +745,101 @@ class TestOLPEngine(unittest.TestCase):
         
         self.assertEqual(debits_brk[ACCOUNT_PATHS["Gift Card Liability"]], 1000)
         self.assertEqual(credits_brk[ACCOUNT_PATHS["Gift Card Breakage"]], 1000)
+
+    # =========================================================================
+    # POST-TRANSACTION ADJUSTMENTS AND VOIDS TESTS (PHASE 9)
+    # =========================================================================
+
+    def test_retroactive_revenue_adjustment(self):
+        """
+        ASC 606 Variable consideration: Retroactive revenue reduction of $10.00 (1000c).
+        """
+        event = OLPEvent(
+            event_id="evt_rev_adj_99",
+            idempotency_key="idemp_rev_adj_99",
+            event_type="revenue_adjustment_posted",
+            timestamp="2026-07-20T12:00:00Z",
+            amount=1000,
+            currency="USD",
+            description="Post-billing volume rebate adjustment",
+            customer_id="cust_client_corp",
+            accounting_context=AccountingContext(
+                role="principal",
+                product_type="digital_download",
+                recognition="point_in_time",
+                payment_method="invoice"
+            )
+        )
+        result = OLPEngine.compile_event(event)
+        tx = result.initial_transaction
+        self.assertTrue(tx.is_balanced())
+        
+        debits = {e.account: e.amount for e in tx.entries if e.type == "debit"}
+        credits = {e.account: e.amount for e in tx.entries if e.type == "credit"}
+        
+        self.assertEqual(debits[ACCOUNT_PATHS["Refunds & Allowances"]], 1000)
+        self.assertEqual(credits[ACCOUNT_PATHS["Accounts Receivable"]], 1000)
+
+    def test_invoice_voided(self):
+        """
+        Invoice Voided: reverse $540.00 (54000c inclusive of $40.00 tax).
+        """
+        event = OLPEvent(
+            event_id="evt_void_invoice",
+            idempotency_key="idemp_void_invoice",
+            event_type="invoice_voided",
+            timestamp="2026-07-17T09:00:00Z",
+            amount=54000,
+            tax_amount=4000,
+            currency="USD",
+            description="Void invoice #908 issued in error",
+            customer_id="cust_bigcorp",
+            accounting_context=AccountingContext(
+                role="principal",
+                product_type="digital_download",
+                recognition="point_in_time",
+                payment_method="invoice"
+            )
+        )
+        result = OLPEngine.compile_event(event)
+        tx = result.initial_transaction
+        self.assertTrue(tx.is_balanced())
+        
+        debits = {e.account: e.amount for e in tx.entries if e.type == "debit"}
+        credits = {e.account: e.amount for e in tx.entries if e.type == "credit"}
+        
+        self.assertEqual(debits[ACCOUNT_PATHS["Gross Revenue"]], 50000)
+        self.assertEqual(debits[ACCOUNT_PATHS["Sales Tax Payable"]], 4000)
+        self.assertEqual(credits[ACCOUNT_PATHS["Accounts Receivable"]], 54000)
+
+    def test_accrual_reversed(self):
+        """
+        Accrual reversed: Debit AP (Vendor) and Credit Revenue / Cost.
+        """
+        event = OLPEvent(
+            event_id="evt_accrual_rev",
+            idempotency_key="idemp_accrual_rev",
+            event_type="accrual_reversed",
+            timestamp="2026-07-20T12:00:00Z",
+            amount=8000,
+            currency="USD",
+            description="Reverse over-accrued vendor payables",
+            customer_id="vendor_xyz",
+            accounting_context=AccountingContext(
+                role="agent",
+                product_type="physical",
+                recognition="point_in_time"
+            )
+        )
+        result = OLPEngine.compile_event(event)
+        tx = result.initial_transaction
+        self.assertTrue(tx.is_balanced())
+        
+        debits = {e.account: e.amount for e in tx.entries if e.type == "debit"}
+        credits = {e.account: e.amount for e in tx.entries if e.type == "credit"}
+        
+        self.assertEqual(debits[ACCOUNT_PATHS["Accounts Payable (Vendor)"]], 8000)
+        self.assertEqual(credits[ACCOUNT_PATHS["Gross Revenue"]], 8000)
 
     def test_validation_errors(self):
         with self.assertRaises(ValueError):

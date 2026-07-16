@@ -355,8 +355,6 @@ def run_demo():
     # Scenario J: Multi-Element Bundle Allocations (Kindle + SaaS)
     # -------------------------------------------------------------------------
     print("SCENARIO J: Multi-Element Bundle Allocations (Kindle + Unlimited Sub - ASC 606).")
-    print("Customer buys a Kindle ($100.00 / 10000c - point_in_time) + 3-month SaaS Sub ($30.00 / 3000c - over_time) bundle.")
-    print("Gross Price is $130.00 + $13.00 tax = $143.00 (14300c). Processor fee is $3.90 (390c).")
     device_ctx = AccountingContext(role="principal", product_type="physical", recognition="point_in_time")
     sub_ctx = AccountingContext(role="principal", product_type="digital_saas", recognition="over_time", term_months=3)
     
@@ -372,8 +370,8 @@ def run_demo():
         idempotency_key="idemp_bundle_order_1122",
         accounting_context=device_ctx,
         line_items=[
-            LineItem(item_id="kindle_hardware", price=10000, cogs_estimate=3500), # physical point-in-time
-            LineItem(item_id="kindle_unlimited_3mo", price=3000, accounting_context=sub_ctx) # overrides with over-time SaaS
+            LineItem(item_id="kindle_hardware", price=10000, cogs_estimate=3500),
+            LineItem(item_id="kindle_unlimited_3mo", price=3000, accounting_context=sub_ctx)
         ]
     )
     result_j = OLPEngine.compile_event(event_j)
@@ -387,8 +385,6 @@ def run_demo():
     # Scenario K: Sales Returns Reserves & Refund Liabilities (ASC 606)
     # -------------------------------------------------------------------------
     print("SCENARIO K: Sales Returns Reserves & Refund Liabilities (ASC 606).")
-    print("Book sold for $100.00 (10000c) with COGS $40.00 (4000c). Returns Reserve expected rate is 3% (300 bps).")
-    print("Net revenue = $97.00, Refund Reserve = $3.00. Net COGS = $38.80, Right to Recover Asset = $1.20.")
     event_k = OLPEvent(
         event_id="evt_returns_reserve_01",
         timestamp="2026-07-16T12:00:00Z",
@@ -462,6 +458,55 @@ def run_demo():
     )
     result_l_brk = OLPEngine.compile_event(event_l_brk)
     format_transaction(result_l_brk.initial_transaction)
+
+    # -------------------------------------------------------------------------
+    # Scenario M: Voiding a B2B Invoice directly
+    # -------------------------------------------------------------------------
+    print("SCENARIO M: Voiding a B2B Invoice directly (reversing billing errors).")
+    print("B2B invoice of $540.00 (54000c, inclusive of $40.00 tax) net 30 is voided:")
+    event_m = OLPEvent(
+        event_id="evt_void_err_inv",
+        event_type="invoice_voided",
+        idempotency_key="idemp_void_err_inv",
+        timestamp="2026-07-17T09:00:00Z",
+        amount=54000,
+        tax_amount=4000,
+        currency="USD",
+        description="Void enterprise license #908 issued in error",
+        customer_id="cust_bigcorp",
+        accounting_context=AccountingContext(
+            role="principal",
+            product_type="digital_download",
+            recognition="point_in_time",
+            payment_method="invoice"
+        )
+    )
+    result_m = OLPEngine.compile_event(event_m)
+    format_transaction(result_m.initial_transaction)
+
+    # -------------------------------------------------------------------------
+    # Scenario N: Retroactive Volume Rebate Revenue Adjustment (ASC 606)
+    # -------------------------------------------------------------------------
+    print("SCENARIO N: Retroactive Volume Rebate Revenue Adjustment (ASC 606).")
+    print("Customer reaches a cumulative rebate tier, retroactively lowering AR by $10.00 (1000c):")
+    event_n = OLPEvent(
+        event_id="evt_retro_rebate",
+        event_type="revenue_adjustment_posted",
+        idempotency_key="idemp_retro_rebate",
+        timestamp="2026-07-20T12:00:00Z",
+        amount=1000,
+        currency="USD",
+        description="Rebate credit note adjustment",
+        customer_id="cust_client_corp",
+        accounting_context=AccountingContext(
+            role="principal",
+            product_type="digital_download",
+            recognition="point_in_time",
+            payment_method="invoice"
+        )
+    )
+    result_n = OLPEngine.compile_event(event_n)
+    format_transaction(result_n.initial_transaction)
 
 if __name__ == "__main__":
     run_demo()

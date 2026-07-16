@@ -34,7 +34,7 @@ A standard OLP event payload contains transactional details, metadata routing he
 ```json
 {
   "event_id": "evt_100293",
-  "event_type": "payment_received", // ["payment_received" | "fulfillment_completed" | "immediate_sale" | "payment_settled" | "refund_issued" | "goods_returned" | "contract_billed" | "invoice_written_off" | "order_placed" | "charge_settled" | "payout_cleared" | "gift_card_purchased" | "gift_card_redeemed" | "gift_card_breakage_recognized"]
+  "event_type": "payment_received", // ["payment_received" | "fulfillment_completed" | "immediate_sale" | "payment_settled" | "refund_issued" | "goods_returned" | "contract_billed" | "invoice_written_off" | "order_placed" | "charge_settled" | "payout_cleared" | "gift_card_purchased" | "gift_card_redeemed" | "gift_card_breakage_recognized" | "revenue_adjustment_posted" | "invoice_voided" | "accrual_reversed"]
   "timestamp": "2026-07-16T08:00:00Z",
   "idempotency_key": "idemp-9a8b7c6d-5e4f-3a2b", // Required to prevent double-posting
   "amount": 12000,                  // Gross amount in cents (inclusive of tax)
@@ -222,3 +222,18 @@ The engine routes the event payload based on the `accounting_context` values and
 * **Event `"gift_card_breakage_recognized"`**:
   * `Debit: /liabilities/gift_card` (Breakage Amount)
   * `Credit: /equity/revenue/breakage` (Breakage Amount)
+
+### B. Post-Fulfillment Corrections & Adjustments
+* **Event `"revenue_adjustment_posted"`**:
+  * Represents a retroactive rebate or contract revision (ASC 606 Variable Consideration).
+  * `Debit: /equity/revenue/refunds_allowances` (Adjustment Amount)
+  * `Credit: [Asset/Liability Account]` (Adjustment Amount) *(e.g. Cash, Accounts Receivable, or Deferred Revenue based on payment_method / context)*
+* **Event `"invoice_voided"`**:
+  * Direct cancellation of an invoice before bad debt arises. Reverses the entire billed invoice.
+  * `Debit: /equity/revenue/gross` (Invoice Base Amount)
+  * `Debit: [Tax Account]` (Invoice Tax Amount)
+  * `Credit: /assets/receivables/ar` (Invoice Gross Amount)
+* **Event `"accrual_reversed"`**:
+  * Direct reversal of vendor payables or accrued liabilities.
+  * `Debit: /liabilities/payables/vendor` (Accrued Amount)
+  * `Credit: /equity/revenue/gross` (or custom recovery account)

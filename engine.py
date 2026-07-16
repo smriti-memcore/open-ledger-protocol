@@ -179,7 +179,8 @@ class OLPEngine:
         if has_line_overrides and event.event_type not in (
             "payment_settled", "refund_issued", "goods_returned", 
             "contract_billed", "invoice_written_off", "gift_card_purchased",
-            "gift_card_redeemed", "gift_card_breakage_recognized"
+            "gift_card_redeemed", "gift_card_breakage_recognized",
+            "revenue_adjustment_posted", "invoice_voided", "accrual_reversed"
         ):
             return OLPEngine._compile_split_bundle(event)
 
@@ -190,6 +191,12 @@ class OLPEngine:
             return OLPEngine._compile_gift_card_redeemed(event)
         elif event.event_type == "gift_card_breakage_recognized":
             return OLPEngine._compile_gift_card_breakage(event)
+        elif event.event_type == "revenue_adjustment_posted":
+            res = OLPEngine._compile_revenue_adjustment(event)
+        elif event.event_type == "invoice_voided":
+            res = OLPEngine._compile_invoice_voided(event)
+        elif event.event_type == "accrual_reversed":
+            res = OLPEngine._compile_accrual_reversed(event)
         elif event.event_type == "payment_settled":
             res = OLPEngine._compile_payment_settled(event)
         elif event.event_type == "refund_issued":
@@ -901,3 +908,68 @@ class OLPEngine:
             amort_txs.append(amort_tx)
 
         return CompilationResult(initial_transaction=init_tx, amortization_schedule=amort_txs)
+
+    @staticmethod
+    def _compile_revenue_adjustment(event: OLPEvent) -> CompilationResult:
+        tx_id = f"tx_rev_adj_{uuid.uuid4().hex[:8]}"
+        credit_account = OLPEngine._get_debit_asset_account(event)
+        
+        entries = [
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Refunds & Allowances"), type="debit", amount=event.amount),
+            LedgerEntry(account=credit_account, type="credit", amount=event.amount)
+        ]
+        
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            description=f"OLP Revenue Adjustment Posted: {event.description}",
+            status="posted",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
+
+    @staticmethod
+    def _compile_invoice_voided(event: OLPEvent) -> CompilationResult:
+        tx_id = f"tx_void_{uuid.uuid4().hex[:8]}"
+        base_amount = event.amount - event.tax_amount
+        tax_acct = OLPEngine._get_tax_account(event)
+        
+        entries = [
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Gross Revenue"), type="debit", amount=base_amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Accounts Receivable"), type="credit", amount=event.amount)
+        ]
+        if event.tax_amount > 0:
+            entries.append(LedgerEntry(account=tax_acct, type="debit", amount=event.tax_amount))
+            
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            description=f"OLP Invoice Voided: {event.description}",
+            status="posted",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
+
+    @staticmethod
+    def _compile_accrual_reversed(event: OLPEvent) -> CompilationResult:
+        tx_id = f"tx_accrual_rev_{uuid.uuid4().hex[:8]}"
+        
+        entries = [
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Accounts Payable (Vendor)"), type="debit", amount=event.amount),
+            LedgerEntry(account=OLPEngine._get_account_path(event, "Gross Revenue"), type="credit", amount=event.amount)
+        ]
+        
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            description=f"OLP Accrual Reversed: {event.description}",
+            status="posted",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
