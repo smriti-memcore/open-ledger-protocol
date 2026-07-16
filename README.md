@@ -1,18 +1,28 @@
 # Open Ledger Protocol (OLP) Reference Implementation
 
-This project contains a working reference implementation of the **Open Ledger Protocol (OLP)**. 
+This project contains the reference implementation of the **Open Ledger Protocol (OLP) Version 3.0**. 
 
-OLP is a developer-centric financial accounting specification that abstracts standard double-entry bookkeeping rules out of business application database layers. It acts like an "HTTP header" standard for sales events: by attaching key context headers (e.g., role, product type, recognition model), a checkout engine can post raw events and have them compiled into compliant, balanced journal entries dynamically.
+OLP is an open, developer-centric financial accounting specification that abstracts standard double-entry bookkeeping rules out of application database layers. It acts like an "HTTP header" standard for sales events: by attaching key context headers (e.g., role, product type, recognition model), a checkout engine can post raw events and have them compiled into compliant, balanced journal entries dynamically.
+
+## Key Features in Version 3.0
+
+*   **Integer-Cents Arithmetic**: All money values are integers in minor currency units (cents, e.g. `$100.00` = `10000`) to avoid IEEE 754 float rounding errors.
+*   **Standard Ledger Account Paths**: Account names map to hierarchical charts of accounts (e.g. `/assets/liquid/cash` or `/liabilities/deferred/revenue`) matching patterns used by enterprise engines like Twisp and Fragment.
+*   **Fulfillment Lifecycles**: Supports separating cash payment events (`payment_received`) from delivery/fulfillment control transfer events (`fulfillment_completed`).
+*   **Accounts Receivable Invoicing**: Supports B2B Net-30 invoice creation and wire cash settlement (`payment_settled`).
+*   **GAAP Contra-Revenue & Returns**: Handles customer refunds (`refund_issued`) and physical warehouse inventory write-backs (`goods_returned`).
+*   **Step 3 ASC 606 Proportional Discounts**: Transaction coupons are distributed proportionally across line items before recognition rules apply.
+*   **Idempotency & Status**: Enforces `idempotency_key` payloads to prevent double-posting and includes transaction `status` fields (`posted`/`pending`).
+
+---
 
 ## Project Structure
 
-*   [SPECIFICATION.md](file:///Users/shivtatva/HomeProjects/open-ledger-protocol/SPECIFICATION.md): The draft OLP standards documentation defining payloads, headers, and the compilation ruleset.
+*   [SPECIFICATION.md](file:///Users/shivtatva/HomeProjects/open-ledger-protocol/SPECIFICATION.md): The draft OLP standards documentation defining payloads, headers, paths, and the compilation ruleset.
 *   [engine.py](file:///Users/shivtatva/HomeProjects/open-ledger-protocol/engine.py): The Python reference implementation containing the compiler state machine.
-*   [test_engine.py](file:///Users/shivtatva/HomeProjects/open-ledger-protocol/test_engine.py): Comprehensive unit tests covering the four major matrix scenarios:
-    1.  **Rule A (Principal + Physical + Point-in-Time):** Standard physical retail/e-commerce.
-    2.  **Rule B (Principal + Digital/SaaS + Over-Time):** Standard SaaS recurring revenue.
-    3.  **Rule C (Agent + Physical + Point-in-Time):** Marketplace selling physical goods.
-    4.  **Rule D (Agent + Digital/SaaS + Over-Time):** Subscription platforms / App stores.
+*   [test_engine.py](file:///Users/shivtatva/HomeProjects/open-ledger-protocol/test_engine.py): Comprehensive unit tests covering the core scenarios and edge cases.
+*   [demo.py](file:///Users/shivtatva/HomeProjects/open-ledger-protocol/demo.py): A runnable console application printing formatted, balanced ledger reports.
+*   [COMPETITOR_COMPARISON.md](file:///Users/shivtatva/HomeProjects/open-ledger-protocol/COMPETITOR_COMPARISON.md): Analysis of OLP design patterns against Modern Treasury, Twisp, and Fragment.
 
 ---
 
@@ -24,6 +34,8 @@ To run the automated tests and verify the OLP engine:
 python3 -m unittest test_engine.py
 ```
 
-### Extending the Protocol
+To run the console demo:
 
-To add custom parameters (such as localization headers for VAT/sales tax logic or currency hedging flags), extend the `AccountingContext` class in `engine.py` and implement the corresponding state-routing logic.
+```bash
+python3 demo.py
+```
