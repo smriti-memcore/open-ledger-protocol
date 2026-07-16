@@ -12,14 +12,13 @@ def format_transaction(tx):
     print(f"{'Standard Ledger Account Path':<45} | {'Type':<8} | {'Amount ($)':>12}")
     print("-" * 80)
     for entry in tx.entries:
-        # Convert minor unit cents back to dollars for the readable display
         amt_dollars = entry.amount / 100.0
         amt_str = f"${amt_dollars:,.2f}"
         print(f"{entry.account:<45} | {entry.type.upper():<8} | {amt_str:>12}")
     print("=" * 80 + "\n")
 
 def run_demo():
-    print("RUNNING OPEN LEDGER PROTOCOL (OLP) DEMO - VERSION 1.0 (ENTERPRISE PATHS & CENTS)\n")
+    print("RUNNING OPEN LEDGER PROTOCOL (OLP) DEMO - VERSION 1.0 (ADVANCED CPA PARITY)\n")
     
     # -------------------------------------------------------------------------
     # Scenario A: E-Commerce Retail Sale with VAT, Discount, and Stripe fees
@@ -52,9 +51,9 @@ def run_demo():
     format_transaction(result_a.initial_transaction)
 
     # -------------------------------------------------------------------------
-    # Scenario B: B2B Invoice Lifecycle (Accounts Receivable aging)
+    # Scenario B: B2B Invoice FX Revaluation Lifecycle (ASC 830)
     # -------------------------------------------------------------------------
-    print("SCENARIO B: B2B Invoice Lifecycle (Accounts Receivable flow).")
+    print("SCENARIO B: B2B Invoice FX Revaluation Lifecycle (ASC 830).")
     print(">>> Day 1: Enterprise customer is invoiced $540.00 (54000c, inclusive of $40.00 VAT) net 30:")
     event_b_inv = OLPEvent(
         event_id="evt_inv_908",
@@ -75,7 +74,8 @@ def run_demo():
     result_b_inv = OLPEngine.compile_event(event_b_inv)
     format_transaction(result_b_inv.initial_transaction)
 
-    print(">>> Day 15: BigCorp settles invoice via Wire. Wire transfer fee is $15.00 (1500c):")
+    print(">>> Day 15: Wire settled in foreign currency. Conversion rate yields $520.00 (52000c).")
+    print("This results in a $20.00 (2000c) FX loss. Wire fee is $15.00 (1500c).")
     event_b_pay = OLPEvent(
         event_id="evt_settle_908",
         event_type="payment_settled",
@@ -83,9 +83,10 @@ def run_demo():
         timestamp="2026-07-31T09:00:00Z",
         amount=54000,
         currency="USD",
-        description="Wire Payment Settled for Invoice #908",
+        description="Wire Payment Settled with FX Revaluation",
         customer_id="cust_bigcorp",
         processing_fee=1500,
+        functional_amount=52000,
         accounting_context=AccountingContext(
             role="principal",
             product_type="digital_download",
@@ -97,20 +98,19 @@ def run_demo():
     format_transaction(result_b_pay.initial_transaction)
 
     # -------------------------------------------------------------------------
-    # Scenario C: SaaS Subscription (Over-Time) with Tax and Card Fee splits
+    # Scenario C: SaaS Subscription with Amortized Commission Costs (ASC 340-40)
     # -------------------------------------------------------------------------
-    print("SCENARIO C: SaaS subscription recognized over 3 months with Tax/Fee splits.")
-    print("Customer paid $105.00 / 10500c ($100 base + $5 sales tax). Card fee was $3.00 / 300c.")
+    print("SCENARIO C: SaaS subscription over 3 months with Amortized Commissions (ASC 340-40).")
+    print("Customer paid $300.00 (30000c). Salesperson paid $12.00 (1200c) commission.")
     event_c = OLPEvent(
-        event_id="evt_saas_700",
-        idempotency_key="idemp_saas_4d9f",
+        event_id="evt_saas_costs",
+        idempotency_key="idemp_saas_costs",
         timestamp="2026-07-16T12:00:00Z",
-        amount=10500,
+        amount=30000,
         currency="USD",
-        description="Developer Plan (Quarterly Sub)",
+        description="Premium Dev Plan (Quarterly Sub)",
         customer_id="cust_dev_user",
-        tax_amount=500,
-        processing_fee=300,
+        capitalized_costs=1200,
         accounting_context=AccountingContext(
             role="principal",
             product_type="digital_saas",
@@ -120,58 +120,77 @@ def run_demo():
         )
     )
     result_c = OLPEngine.compile_event(event_c)
-    print(">>> Initial Cash & Deferred Liability splits:")
+    print(">>> Initial Cash, Deferred Revenue & Commission Cost bookings:")
     format_transaction(result_c.initial_transaction)
-    print(">>> Monthly Amortization schedules (base revenue only):")
+    print(">>> Monthly Amortization schedules (matching revenue and commission expense amortization):")
     for month_tx in result_c.amortization_schedule:
         format_transaction(month_tx)
 
     # -------------------------------------------------------------------------
-    # Scenario D: Returns and Refunds Processing
+    # Scenario D: Contract Asset (Unbilled) Billing Lifecycle (ASC 606)
     # -------------------------------------------------------------------------
-    print("SCENARIO D: Returns and Refunds (Contra-Revenue & Inventory write-back).")
-    print(">>> Step 1: Customer returns textbook, refunding $108.00 / 10800c ($100.00 base + $8.00 VAT):")
-    event_d_ref = OLPEvent(
-        event_id="evt_ref_301",
-        idempotency_key="idemp_refund_8e7f",
-        event_type="refund_issued",
-        timestamp="2026-07-20T14:00:00Z",
-        amount=10800,
+    print("SCENARIO D: Contract Asset (Unbilled AR) Billing Lifecycle (ASC 606).")
+    print(">>> Day 1: Recognize unbilled milestone revenue of $200.00 (20000c):")
+    event_d_unb = OLPEvent(
+        event_id="evt_unb_milestone",
+        timestamp="2026-07-16T12:00:00Z",
+        amount=20000,
         currency="USD",
-        description="Refund for Textbook Order",
-        customer_id="cust_alice",
-        tax_amount=800,
+        description="Unbilled Milestones completed",
+        customer_id="cust_client",
+        idempotency_key="idemp_unb_mile",
         accounting_context=AccountingContext(
             role="principal",
-            product_type="physical",
+            product_type="digital_download",
             recognition="point_in_time",
-            payment_method="card"
+            payment_method="invoice",
+            billing_status="unbilled"
         )
     )
-    result_d_ref = OLPEngine.compile_event(event_d_ref)
-    format_transaction(result_d_ref.initial_transaction)
+    result_d_unb = OLPEngine.compile_event(event_d_unb)
+    format_transaction(result_d_unb.initial_transaction)
 
-    print(">>> Step 2: Textbook returned to warehouse (Reversing COGS and updating inventory asset):")
-    event_d_ret = OLPEvent(
-        event_id="evt_ret_301",
-        idempotency_key="idemp_return_6a5d",
-        event_type="goods_returned",
-        timestamp="2026-07-22T08:00:00Z",
-        amount=10800,
+    print(">>> Day 15: Bill the milestones. Converts $200.00 Contract Asset into billed AR:")
+    event_d_bill = OLPEvent(
+        event_id="evt_bill_milestone",
+        event_type="contract_billed",
+        timestamp="2026-07-30T12:00:00Z",
+        amount=20000,
         currency="USD",
-        description="Textbook inventory return to warehouse",
-        customer_id="cust_alice",
+        description="Convert milestones to Accounts Receivable",
+        customer_id="cust_client",
+        idempotency_key="idemp_bill_mile",
         accounting_context=AccountingContext(
             role="principal",
-            product_type="physical",
+            product_type="digital_download",
             recognition="point_in_time"
-        ),
-        line_items=[
-            LineItem(item_id="prod_textbook", price=10000, cogs_estimate=4500)
-        ]
+        )
     )
-    result_d_ret = OLPEngine.compile_event(event_d_ret)
-    format_transaction(result_d_ret.initial_transaction)
+    result_d_bill = OLPEngine.compile_event(event_d_bill)
+    format_transaction(result_d_bill.initial_transaction)
+
+    # -------------------------------------------------------------------------
+    # Scenario E: Invoice default & Bad Debt write-off
+    # -------------------------------------------------------------------------
+    print("SCENARIO E: Invoice default & Bad Debt write-off.")
+    print("An outstanding customer invoice of $150.00 (15000c) is written off as uncollectible:")
+    event_e_wo = OLPEvent(
+        event_id="evt_write_off_inv",
+        event_type="invoice_written_off",
+        timestamp="2026-07-25T12:00:00Z",
+        amount=15000,
+        currency="USD",
+        description="Write off defaulted client invoice",
+        customer_id="cust_bad_user",
+        idempotency_key="idemp_wo_inv",
+        accounting_context=AccountingContext(
+            role="principal",
+            product_type="digital_download",
+            recognition="point_in_time"
+        )
+    )
+    result_e_wo = OLPEngine.compile_event(event_e_wo)
+    format_transaction(result_e_wo.initial_transaction)
 
 if __name__ == "__main__":
     run_demo()

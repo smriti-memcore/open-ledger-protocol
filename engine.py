@@ -9,13 +9,14 @@ class AccountingContext:
     product_type: str               # "physical" | "digital_saas" | "digital_download"
     recognition: str                # "point_in_time" | "over_time"
     term_months: Optional[int] = None
-    platform_fee_percent: float = 0.20  # Keep platform cut percentage as a float multiplier (e.g., 0.20)
+    platform_fee_percent: float = 0.20  # Keep platform cut percentage as a float multiplier
     payment_method: str = "card"    # "card" | "invoice"
+    billing_status: str = "billed"  # "billed" | "unbilled"
 
 @dataclass
 class LineItem:
     item_id: str
-    price: int                      # In cents (e.g. $10.00 = 1000)
+    price: int                      # In cents
     cogs_estimate: int = 0          # In cents
 
 @dataclass
@@ -32,11 +33,13 @@ class OLPEvent:
     tax_amount: int = 0             # In cents
     processing_fee: int = 0         # In cents
     discount_amount: int = 0        # In cents
+    capitalized_costs: int = 0      # In cents (sales commissions, ASC 340-40)
+    functional_amount: Optional[int] = None # In cents (settled cash local equivalent, ASC 830)
     line_items: List[LineItem] = field(default_factory=list)
 
 @dataclass
 class LedgerEntry:
-    account: str                    # Standardized path string, e.g. "/assets/liquid/cash"
+    account: str                    # Standardized path string
     type: str                       # "debit" | "credit"
     amount: int                     # In cents
 
@@ -60,22 +63,29 @@ class CompilationResult:
     initial_transaction: Transaction
     amortization_schedule: List[Transaction] = field(default_factory=list)
 
-# Chart of Accounts standard mappings
+# Chart of Accounts mappings
 ACCOUNT_PATHS = {
     "Cash": "/assets/liquid/cash",
     "Accounts Receivable": "/assets/receivables/ar",
+    "Contract Assets": "/assets/receivables/contract_assets",
     "Inventory": "/assets/inventory",
+    "Deferred Contract Costs": "/assets/deferred_costs/commissions",
     "Deferred Revenue": "/liabilities/deferred/revenue",
     "Deferred Payable (Vendor)": "/liabilities/deferred/payable_vendor",
     "Deferred Commission Revenue": "/liabilities/deferred/commission",
     "Accounts Payable (Vendor)": "/liabilities/payables/vendor",
     "Sales Tax Payable": "/liabilities/tax/payable",
+    "Commissions Payable": "/liabilities/payables/commissions",
     "Gross Revenue": "/equity/revenue/gross",
     "Subscription Revenue": "/equity/revenue/subscription",
     "Commission Revenue": "/equity/revenue/commission",
     "Refunds & Allowances": "/equity/revenue/refunds_allowances",
+    "Gain on FX": "/equity/gain_fx",
     "Payment Processing Expense": "/expenses/processing/fees",
-    "Cost of Goods Sold": "/expenses/cogs"
+    "Cost of Goods Sold": "/expenses/cogs",
+    "Amortized Commission Expense": "/expenses/commissions",
+    "Bad Debt Expense": "/expenses/bad_debt",
+    "Loss on FX": "/expenses/fx_loss"
 }
 
 class OLPEngine:
@@ -142,6 +152,10 @@ class OLPEngine:
             return OLPEngine._compile_refund_issued(event)
         elif event.event_type == "goods_returned":
             return OLPEngine._compile_goods_returned(event, total_cogs)
+        elif event.event_type == "contract_billed":
+            return OLPEngine._compile_contract_billed(event)
+        elif event.event_type == "invoice_written_off":
+            return OLPEngine._compile_invoice_written_off(event)
 
         # Route core rules
         if ctx.role == "principal":
@@ -158,10 +172,15 @@ class OLPEngine:
     @staticmethod
     def _compile_payment_settled(event: OLPEvent) -> CompilationResult:
         """
-        Record cash settlement for an Accounts Receivable invoice (In Cents).
+        Record cash settlement for an Accounts Receivable invoice, handling FX Gains/Losses (ASC 830).
         """
         tx_id = f"tx_settled_{uuid.uuid4().hex[:8]}"
-        debit_cash = event.amount - event.processing_fee
+        
+        # Check if FX revaluation is needed
+        # functional_amount is the actual cash received in functional currency (excluding fees)
+        target_amount = event.functional_amount if event.functional_amount is not None else event.amount
+        fx_diff = target_amount - event.amount
+        debit_cash = target_amount - event.processing_fee
         
         entries = [
             LedgerEntry(account=ACCOUNT_PATHS["Cash"], type="debit", amount=debit_cash),
@@ -171,13 +190,18 @@ class OLPEngine:
         if event.processing_fee > 0:
             entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
             
+        if fx_diff > 0:
+            entries.append(LedgerEntry(account=ACCOUNT_PATHS["Gain on FX"], type="credit", amount=fx_diff))
+        elif fx_diff < 0:
+            entries.append(LedgerEntry(account=ACCOUNT_PATHS["Loss on FX"], type="debit", amount=abs(fx_diff)))
+            
         tx = Transaction(
             transaction_id=tx_id,
             source_event_id=event.event_id,
             idempotency_key=event.idempotency_key,
             date=event.timestamp,
             status="posted",
-            description=f"OLP Cash Settlement for Invoice: {event.description}",
+            description=f"OLP Cash Settlement & Revaluation: {event.description}",
             entries=entries
         )
         return CompilationResult(initial_transaction=tx)
@@ -232,6 +256,56 @@ class OLPEngine:
         return CompilationResult(initial_transaction=tx)
 
     @staticmethod
+    def _compile_contract_billed(event: OLPEvent) -> CompilationResult:
+        """
+        Convert unbilled Contract Asset to billed Accounts Receivable (ASC 606).
+        """
+        tx_id = f"tx_billed_{uuid.uuid4().hex[:8]}"
+        entries = [
+            LedgerEntry(account=ACCOUNT_PATHS["Accounts Receivable"], type="debit", amount=event.amount),
+            LedgerEntry(account=ACCOUNT_PATHS["Contract Assets"], type="credit", amount=event.amount)
+        ]
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            status="posted",
+            description=f"OLP Contract Billed to AR: {event.description}",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
+
+    @staticmethod
+    def _compile_invoice_written_off(event: OLPEvent) -> CompilationResult:
+        """
+        Write off an unpaid invoice as Bad Debt Expense.
+        """
+        tx_id = f"tx_writeoff_{uuid.uuid4().hex[:8]}"
+        entries = [
+            LedgerEntry(account=ACCOUNT_PATHS["Bad Debt Expense"], type="debit", amount=event.amount),
+            LedgerEntry(account=ACCOUNT_PATHS["Accounts Receivable"], type="credit", amount=event.amount)
+        ]
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            status="posted",
+            description=f"OLP Bad Debt Invoice Write-off: {event.description}",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
+
+    @staticmethod
+    def _get_debit_asset_account(ctx: AccountingContext) -> str:
+        if ctx.payment_method == "invoice":
+            if ctx.billing_status == "unbilled":
+                return ACCOUNT_PATHS["Contract Assets"]
+            return ACCOUNT_PATHS["Accounts Receivable"]
+        return ACCOUNT_PATHS["Cash"]
+
+    @staticmethod
     def _compile_principal_pit(event: OLPEvent, total_cogs: float) -> CompilationResult:
         """
         Rule A: Principal + Physical/Digital + Point-in-Time (In Cents)
@@ -239,17 +313,17 @@ class OLPEngine:
         tx_id = f"tx_pit_{uuid.uuid4().hex[:8]}"
         ctx = event.accounting_context
         
-        debit_asset = "Accounts Receivable" if ctx.payment_method == "invoice" else "Cash"
+        debit_account = OLPEngine._get_debit_asset_account(ctx)
         base_amount = event.amount - event.tax_amount
         
         if event.event_type == "payment_received":
-            debit_cash = event.amount - event.processing_fee if debit_asset == "Cash" else event.amount
+            debit_cash = event.amount - event.processing_fee if debit_account == ACCOUNT_PATHS["Cash"] else event.amount
             entries = [
-                LedgerEntry(account=ACCOUNT_PATHS[debit_asset], type="debit", amount=debit_cash),
+                LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
                 LedgerEntry(account=ACCOUNT_PATHS["Deferred Revenue"], type="credit", amount=base_amount),
                 LedgerEntry(account=ACCOUNT_PATHS["Sales Tax Payable"], type="credit", amount=event.tax_amount)
             ]
-            if event.processing_fee > 0 and debit_asset == "Cash":
+            if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
                 entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
             desc = f"OLP Principal Payment Received (Deferred): {event.description}"
             
@@ -264,13 +338,13 @@ class OLPEngine:
             desc = f"OLP Principal Delivery / Fulfillment (Revenue Recognized): {event.description}"
             
         else: # immediate_sale
-            debit_cash = event.amount - event.processing_fee if debit_asset == "Cash" else event.amount
+            debit_cash = event.amount - event.processing_fee if debit_account == ACCOUNT_PATHS["Cash"] else event.amount
             entries = [
-                LedgerEntry(account=ACCOUNT_PATHS[debit_asset], type="debit", amount=debit_cash),
+                LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
                 LedgerEntry(account=ACCOUNT_PATHS["Gross Revenue"], type="credit", amount=base_amount),
                 LedgerEntry(account=ACCOUNT_PATHS["Sales Tax Payable"], type="credit", amount=event.tax_amount)
             ]
-            if event.processing_fee > 0 and debit_asset == "Cash":
+            if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
                 entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
             if total_cogs > 0:
                 entries.append(LedgerEntry(account=ACCOUNT_PATHS["Cost of Goods Sold"], type="debit", amount=total_cogs))
@@ -295,20 +369,25 @@ class OLPEngine:
         """
         ctx = event.accounting_context
         term = ctx.term_months
-        debit_asset = "Accounts Receivable" if ctx.payment_method == "invoice" else "Cash"
+        debit_account = OLPEngine._get_debit_asset_account(ctx)
         base_amount = event.amount - event.tax_amount
-        debit_cash = event.amount - event.processing_fee if debit_asset == "Cash" else event.amount
+        debit_cash = event.amount - event.processing_fee if debit_account == ACCOUNT_PATHS["Cash"] else event.amount
         
         # Initial booking transaction
         init_tx_id = f"tx_init_{uuid.uuid4().hex[:8]}"
         init_entries = [
-            LedgerEntry(account=ACCOUNT_PATHS[debit_asset], type="debit", amount=debit_cash),
+            LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
             LedgerEntry(account=ACCOUNT_PATHS["Deferred Revenue"], type="credit", amount=base_amount),
             LedgerEntry(account=ACCOUNT_PATHS["Sales Tax Payable"], type="credit", amount=event.tax_amount)
         ]
-        if event.processing_fee > 0 and debit_asset == "Cash":
+        if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
             init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
             
+        # Add Capitalized Commissions Asset booking (ASC 340-40)
+        if event.capitalized_costs > 0:
+            init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Deferred Contract Costs"], type="debit", amount=event.capitalized_costs))
+            init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Commissions Payable"], type="credit", amount=event.capitalized_costs))
+
         init_tx = Transaction(
             transaction_id=init_tx_id,
             source_event_id=event.event_id,
@@ -322,16 +401,22 @@ class OLPEngine:
         # Generate amortization schedules
         amort_txs = []
         monthly_amt = base_amount // term
-        accumulated = 0
+        monthly_cost = event.capitalized_costs // term if event.capitalized_costs > 0 else 0
+        
+        accum_rev = 0
+        accum_cost = 0
 
         event_date = datetime.fromisoformat(event.timestamp.replace("Z", "+00:00"))
         
         for i in range(1, term + 1):
             if i == term:
-                current_monthly_amt = base_amount - accumulated
+                current_monthly_rev = base_amount - accum_rev
+                current_monthly_cost = event.capitalized_costs - accum_cost
             else:
-                current_monthly_amt = monthly_amt
-                accumulated += current_monthly_amt
+                current_monthly_rev = monthly_amt
+                current_monthly_cost = monthly_cost
+                accum_rev += current_monthly_rev
+                accum_cost += current_monthly_cost
 
             year = event_date.year + (event_date.month - 1 + i) // 12
             month = (event_date.month - 1 + i) % 12 + 1
@@ -340,10 +425,15 @@ class OLPEngine:
 
             amort_tx_id = f"tx_amort_{i}_{uuid.uuid4().hex[:8]}"
             amort_entries = [
-                LedgerEntry(account=ACCOUNT_PATHS["Deferred Revenue"], type="debit", amount=current_monthly_amt),
-                LedgerEntry(account=ACCOUNT_PATHS["Subscription Revenue"], type="credit", amount=current_monthly_amt)
+                LedgerEntry(account=ACCOUNT_PATHS["Deferred Revenue"], type="debit", amount=current_monthly_rev),
+                LedgerEntry(account=ACCOUNT_PATHS["Subscription Revenue"], type="credit", amount=current_monthly_rev)
             ]
             
+            # Add cost amortization lines if applicable
+            if event.capitalized_costs > 0:
+                amort_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Amortized Commission Expense"], type="debit", amount=current_monthly_cost))
+                amort_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Deferred Contract Costs"], type="credit", amount=current_monthly_cost))
+
             amort_tx = Transaction(
                 transaction_id=amort_tx_id,
                 source_event_id=event.event_id,
@@ -363,11 +453,10 @@ class OLPEngine:
         Rule C: Agent + Physical/Digital + Point-in-Time (In Cents)
         """
         ctx = event.accounting_context
-        debit_asset = "Accounts Receivable" if ctx.payment_method == "invoice" else "Cash"
-        debit_cash = event.amount - event.processing_fee if debit_asset == "Cash" else event.amount
+        debit_account = OLPEngine._get_debit_asset_account(ctx)
+        debit_cash = event.amount - event.processing_fee if debit_account == ACCOUNT_PATHS["Cash"] else event.amount
         
         base_amount = event.amount - event.tax_amount
-        # Perform multiplication first, then divide by 100 or multiply cut% directly to keep it in integer cents
         commission = int(base_amount * ctx.platform_fee_percent)
         vendor_cut = base_amount - commission
 
@@ -375,12 +464,12 @@ class OLPEngine:
         
         if event.event_type == "payment_received":
             entries = [
-                LedgerEntry(account=ACCOUNT_PATHS[debit_asset], type="debit", amount=debit_cash),
+                LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
                 LedgerEntry(account=ACCOUNT_PATHS["Deferred Payable (Vendor)"], type="credit", amount=vendor_cut),
                 LedgerEntry(account=ACCOUNT_PATHS["Deferred Commission Revenue"], type="credit", amount=commission),
                 LedgerEntry(account=ACCOUNT_PATHS["Sales Tax Payable"], type="credit", amount=event.tax_amount)
             ]
-            if event.processing_fee > 0 and debit_asset == "Cash":
+            if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
                 entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
             desc = f"OLP Agent Payment Received (Deferred): {event.description}"
             
@@ -395,12 +484,12 @@ class OLPEngine:
             
         else: # immediate_sale
             entries = [
-                LedgerEntry(account=ACCOUNT_PATHS[debit_asset], type="debit", amount=debit_cash),
+                LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
                 LedgerEntry(account=ACCOUNT_PATHS["Accounts Payable (Vendor)"], type="credit", amount=vendor_cut),
                 LedgerEntry(account=ACCOUNT_PATHS["Commission Revenue"], type="credit", amount=commission),
                 LedgerEntry(account=ACCOUNT_PATHS["Sales Tax Payable"], type="credit", amount=event.tax_amount)
             ]
-            if event.processing_fee > 0 and debit_asset == "Cash":
+            if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
                 entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
             desc = f"OLP Agent Immediate Sale booking for: {event.description}"
         
@@ -422,8 +511,8 @@ class OLPEngine:
         """
         ctx = event.accounting_context
         term = ctx.term_months
-        debit_asset = "Accounts Receivable" if ctx.payment_method == "invoice" else "Cash"
-        debit_cash = event.amount - event.processing_fee if debit_asset == "Cash" else event.amount
+        debit_account = OLPEngine._get_debit_asset_account(ctx)
+        debit_cash = event.amount - event.processing_fee if debit_account == ACCOUNT_PATHS["Cash"] else event.amount
         
         base_amount = event.amount - event.tax_amount
         commission = int(base_amount * ctx.platform_fee_percent)
@@ -432,12 +521,12 @@ class OLPEngine:
         # Initial booking transaction
         init_tx_id = f"tx_agent_init_{uuid.uuid4().hex[:8]}"
         init_entries = [
-            LedgerEntry(account=ACCOUNT_PATHS[debit_asset], type="debit", amount=debit_cash),
+            LedgerEntry(account=debit_account, type="debit", amount=debit_cash),
             LedgerEntry(account=ACCOUNT_PATHS["Deferred Payable (Vendor)"], type="credit", amount=vendor_cut),
             LedgerEntry(account=ACCOUNT_PATHS["Deferred Commission Revenue"], type="credit", amount=commission),
             LedgerEntry(account=ACCOUNT_PATHS["Sales Tax Payable"], type="credit", amount=event.tax_amount)
         ]
-        if event.processing_fee > 0 and debit_asset == "Cash":
+        if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
             init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
             
         init_tx = Transaction(
