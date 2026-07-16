@@ -30,7 +30,7 @@ A standard OLP event payload contains transactional details, metadata routing he
 ```json
 {
   "event_id": "evt_100293",
-  "event_type": "payment_received", // ["payment_received" | "fulfillment_completed" | "immediate_sale" | "payment_settled" | "refund_issued" | "goods_returned" | "contract_billed" | "invoice_written_off"]
+  "event_type": "payment_received", // ["payment_received" | "fulfillment_completed" | "immediate_sale" | "payment_settled" | "refund_issued" | "goods_returned" | "contract_billed" | "invoice_written_off" | "order_placed" | "charge_settled" | "payout_cleared"]
   "timestamp": "2026-07-16T08:00:00Z",
   "idempotency_key": "idemp-9a8b7c6d-5e4f-3a2b", // Required to prevent double-posting
   "amount": 12000,                  // Gross amount in cents (inclusive of tax)
@@ -71,6 +71,8 @@ In OLP, flat account names are replaced by standardized hierarchical paths. This
 | **Cash** | `/assets/liquid/cash` |
 | **Accounts Receivable** | `/assets/receivables/ar` |
 | **Contract Assets (Unbilled AR)** | `/assets/receivables/contract_assets` |
+| **Order Clearing Account** | `/assets/receivables/order_clearing` |
+| **Payment Clearing Account** | `/assets/receivables/payment_clearing` |
 | **Inventory** | `/assets/inventory` |
 | **Deferred Contract Costs (Assets)** | `/assets/deferred_costs/commissions` |
 | **Deferred Revenue** | `/liabilities/deferred/revenue` |
@@ -240,3 +242,26 @@ If a transaction-level `discount_amount` is provided, the compiler must distribu
 * **Formula**:
   $$\text{Net Price}_i = \text{Price}_i - \left( \text{Discount} \times \frac{\text{Price}_i}{\sum \text{Price}} \right)$$
   *(Using integer-division checks to guarantee the sum of discounts exactly matches `discount_amount`)*
+
+---
+
+## 7. Decoupled Multi-Pipeline Reconciliation (Amazon Scale)
+
+For decoupled transactional setups where the sales pipeline runs separately from payment processor collections and treasury bank payouts:
+
+### A. Business Order Placed (`"order_placed"`)
+Fires when checkout completes. Maps the customer order without knowing merchant processor settlement details.
+* `Debit: /assets/receivables/order_clearing` (Gross Amount)
+* `Credit: /equity/revenue/gross` (Base Price)
+* `Credit: /liabilities/tax/payable` (Tax Amount)
+
+### B. Processor Charge Settled (`"charge_settled"`)
+Fires when the card gateway settles the transaction, tracking processing fees.
+* `Debit: /assets/receivables/payment_clearing` (Gross Amount - Processing Fee)
+* `Debit: /expenses/processing/fees` (Processing Fee)
+* `Credit: /assets/receivables/order_clearing` (Gross Amount)
+
+### C. Treasury Payout Cleared (`"payout_cleared"`)
+Fires when the bank feed clears the deposit into the operating cash account.
+* `Debit: /assets/liquid/cash` (Settled Net Amount)
+* `Credit: /assets/receivables/payment_clearing` (Settled Net Amount)

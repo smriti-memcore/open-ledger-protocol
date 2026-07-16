@@ -9,7 +9,7 @@ class AccountingContext:
     product_type: str               # "physical" | "digital_saas" | "digital_download"
     recognition: str                # "point_in_time" | "over_time"
     term_months: Optional[int] = None
-    platform_fee_percent: float = 0.20  # Keep platform cut percentage as a float multiplier
+    platform_fee_percent: float = 0.20  # Platform cut percentage
     payment_method: str = "card"    # "card" | "invoice"
     billing_status: str = "billed"  # "billed" | "unbilled"
 
@@ -33,8 +33,8 @@ class OLPEvent:
     tax_amount: int = 0             # In cents
     processing_fee: int = 0         # In cents
     discount_amount: int = 0        # In cents
-    capitalized_costs: int = 0      # In cents (sales commissions, ASC 340-40)
-    functional_amount: Optional[int] = None # In cents (settled cash local equivalent, ASC 830)
+    capitalized_costs: int = 0      # In cents
+    functional_amount: Optional[int] = None # In cents
     line_items: List[LineItem] = field(default_factory=list)
 
 @dataclass
@@ -68,6 +68,8 @@ ACCOUNT_PATHS = {
     "Cash": "/assets/liquid/cash",
     "Accounts Receivable": "/assets/receivables/ar",
     "Contract Assets": "/assets/receivables/contract_assets",
+    "Order Clearing": "/assets/receivables/order_clearing",
+    "Payment Clearing": "/assets/receivables/payment_clearing",
     "Inventory": "/assets/inventory",
     "Deferred Contract Costs": "/assets/deferred_costs/commissions",
     "Deferred Revenue": "/liabilities/deferred/revenue",
@@ -145,7 +147,7 @@ class OLPEngine:
         # Compute total COGS
         total_cogs = sum(item.cogs_estimate for item in event.line_items)
 
-        # Route lifecycle events
+        # Route lifecycle & decoupled pipeline events
         if event.event_type == "payment_settled":
             return OLPEngine._compile_payment_settled(event)
         elif event.event_type == "refund_issued":
@@ -156,6 +158,12 @@ class OLPEngine:
             return OLPEngine._compile_contract_billed(event)
         elif event.event_type == "invoice_written_off":
             return OLPEngine._compile_invoice_written_off(event)
+        elif event.event_type == "order_placed":
+            return OLPEngine._compile_order_placed(event)
+        elif event.event_type == "charge_settled":
+            return OLPEngine._compile_charge_settled(event)
+        elif event.event_type == "payout_cleared":
+            return OLPEngine._compile_payout_cleared(event)
 
         # Route core rules
         if ctx.role == "principal":
@@ -170,14 +178,81 @@ class OLPEngine:
                 return OLPEngine._compile_agent_ot(event)
 
     @staticmethod
+    def _compile_order_placed(event: OLPEvent) -> CompilationResult:
+        """
+        Record order checkout placing, debiting order clearing account.
+        """
+        tx_id = f"tx_ord_{uuid.uuid4().hex[:8]}"
+        base_amount = event.amount - event.tax_amount
+        
+        entries = [
+            LedgerEntry(account=ACCOUNT_PATHS["Order Clearing"], type="debit", amount=event.amount),
+            LedgerEntry(account=ACCOUNT_PATHS["Gross Revenue"], type="credit", amount=base_amount),
+            LedgerEntry(account=ACCOUNT_PATHS["Sales Tax Payable"], type="credit", amount=event.tax_amount)
+        ]
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            status="posted",
+            description=f"OLP Order Placed (Decoupled): {event.description}",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
+
+    @staticmethod
+    def _compile_charge_settled(event: OLPEvent) -> CompilationResult:
+        """
+        Record gateway card settlement, debiting payment clearing and crediting order clearing.
+        """
+        tx_id = f"tx_chg_{uuid.uuid4().hex[:8]}"
+        net_amount = event.amount - event.processing_fee
+        
+        entries = [
+            LedgerEntry(account=ACCOUNT_PATHS["Payment Clearing"], type="debit", amount=net_amount),
+            LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee),
+            LedgerEntry(account=ACCOUNT_PATHS["Order Clearing"], type="credit", amount=event.amount)
+        ]
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            status="posted",
+            description=f"OLP Gateway Charge Settled (Decoupled): {event.description}",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
+
+    @staticmethod
+    def _compile_payout_cleared(event: OLPEvent) -> CompilationResult:
+        """
+        Record final bank wire/transfer payout clearing, crediting payment clearing.
+        """
+        tx_id = f"tx_pay_{uuid.uuid4().hex[:8]}"
+        entries = [
+            LedgerEntry(account=ACCOUNT_PATHS["Cash"], type="debit", amount=event.amount),
+            LedgerEntry(account=ACCOUNT_PATHS["Payment Clearing"], type="credit", amount=event.amount)
+        ]
+        tx = Transaction(
+            transaction_id=tx_id,
+            source_event_id=event.event_id,
+            idempotency_key=event.idempotency_key,
+            date=event.timestamp,
+            status="posted",
+            description=f"OLP Bank Payout Cleared (Decoupled): {event.description}",
+            entries=entries
+        )
+        return CompilationResult(initial_transaction=tx)
+
+    @staticmethod
     def _compile_payment_settled(event: OLPEvent) -> CompilationResult:
         """
         Record cash settlement for an Accounts Receivable invoice, handling FX Gains/Losses (ASC 830).
         """
         tx_id = f"tx_settled_{uuid.uuid4().hex[:8]}"
         
-        # Check if FX revaluation is needed
-        # functional_amount is the actual cash received in functional currency (excluding fees)
         target_amount = event.functional_amount if event.functional_amount is not None else event.amount
         fx_diff = target_amount - event.amount
         debit_cash = target_amount - event.processing_fee
@@ -383,7 +458,7 @@ class OLPEngine:
         if event.processing_fee > 0 and debit_account == ACCOUNT_PATHS["Cash"]:
             init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Payment Processing Expense"], type="debit", amount=event.processing_fee))
             
-        # Add Capitalized Commissions Asset booking (ASC 340-40)
+        # Add Capitalized Commissions (ASC 340-40)
         if event.capitalized_costs > 0:
             init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Deferred Contract Costs"], type="debit", amount=event.capitalized_costs))
             init_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Commissions Payable"], type="credit", amount=event.capitalized_costs))
@@ -429,7 +504,7 @@ class OLPEngine:
                 LedgerEntry(account=ACCOUNT_PATHS["Subscription Revenue"], type="credit", amount=current_monthly_rev)
             ]
             
-            # Add cost amortization lines if applicable
+            # Cost amortization
             if event.capitalized_costs > 0:
                 amort_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Amortized Commission Expense"], type="debit", amount=current_monthly_cost))
                 amort_entries.append(LedgerEntry(account=ACCOUNT_PATHS["Deferred Contract Costs"], type="credit", amount=current_monthly_cost))

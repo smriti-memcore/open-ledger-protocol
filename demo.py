@@ -127,7 +127,7 @@ def run_demo():
         format_transaction(month_tx)
 
     # -------------------------------------------------------------------------
-    # Scenario D: Contract Asset (Unbilled) Billing Lifecycle (ASC 606)
+    # Scenario D: Contract Asset (Unbilled AR) Billing Lifecycle (ASC 606)
     # -------------------------------------------------------------------------
     print("SCENARIO D: Contract Asset (Unbilled AR) Billing Lifecycle (ASC 606).")
     print(">>> Day 1: Recognize unbilled milestone revenue of $200.00 (20000c):")
@@ -191,6 +191,70 @@ def run_demo():
     )
     result_e_wo = OLPEngine.compile_event(event_e_wo)
     format_transaction(result_e_wo.initial_transaction)
+
+    # -------------------------------------------------------------------------
+    # Scenario F: Decoupled Multi-Pipeline Reconciliation (Amazon Scale)
+    # -------------------------------------------------------------------------
+    print("SCENARIO F: Decoupled Multi-Pipeline Reconciliation (Amazon Scale).")
+    print(">>> Stage 1: Checkout places order for $108.00 (10800c inclusive of $8.00 VAT) - Business side:")
+    event_f_order = OLPEvent(
+        event_id="order_556677",
+        event_type="order_placed",
+        timestamp="2026-07-16T12:00:00Z",
+        amount=10800,
+        currency="USD",
+        description="Business Side order checkout",
+        customer_id="cust_sam",
+        tax_amount=800,
+        idempotency_key="idemp_order_556",
+        accounting_context=AccountingContext(
+            role="principal",
+            product_type="physical",
+            recognition="point_in_time",
+            payment_method="card"
+        )
+    )
+    result_f_order = OLPEngine.compile_event(event_f_order)
+    format_transaction(result_f_order.initial_transaction)
+
+    print(">>> Stage 2: Card gateway processes charge, logging $3.20 (320c) fee - Payments side:")
+    event_f_settle = OLPEvent(
+        event_id="settle_556677",
+        event_type="charge_settled",
+        timestamp="2026-07-16T12:05:00Z",
+        amount=10800,
+        processing_fee=320,
+        currency="USD",
+        description="Card processor captures checkout payment",
+        customer_id="cust_sam",
+        idempotency_key="idemp_settle_556",
+        accounting_context=AccountingContext(
+            role="principal",
+            product_type="physical",
+            recognition="point_in_time"
+        )
+    )
+    result_f_settle = OLPEngine.compile_event(event_f_settle)
+    format_transaction(result_f_settle.initial_transaction)
+
+    print(">>> Stage 3: Operating bank payouts clear. Stripe deposits net cash of $104.80 (10480c):")
+    event_f_payout = OLPEvent(
+        event_id="payout_556677",
+        event_type="payout_cleared",
+        timestamp="2026-07-18T06:00:00Z",
+        amount=10480,
+        currency="USD",
+        description="Bank payout sweep cleared",
+        customer_id="cust_sam",
+        idempotency_key="idemp_payout_556",
+        accounting_context=AccountingContext(
+            role="principal",
+            product_type="physical",
+            recognition="point_in_time"
+        )
+    )
+    result_f_payout = OLPEngine.compile_event(event_f_payout)
+    format_transaction(result_f_payout.initial_transaction)
 
 if __name__ == "__main__":
     run_demo()

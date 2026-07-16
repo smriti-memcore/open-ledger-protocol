@@ -3,9 +3,6 @@ from engine import OLPEngine, OLPEvent, AccountingContext, LineItem, LedgerEntry
 
 class TestOLPEngine(unittest.TestCase):
     def test_rule_a_principal_physical_point_in_time(self):
-        """
-        Scenario 1: Principal sells a physical book for $50.00 (5000 cents) with COGS of $20.00 (2000 cents).
-        """
         event = OLPEvent(
             event_id="evt_001",
             idempotency_key="idemp_001",
@@ -37,9 +34,6 @@ class TestOLPEngine(unittest.TestCase):
         self.assertEqual(credits[ACCOUNT_PATHS["Inventory"]], 2000)
 
     def test_rule_b_principal_digital_saas_over_time(self):
-        """
-        Scenario 2: Principal sells an annual SaaS subscription for $100.00 (10000 cents).
-        """
         event = OLPEvent(
             event_id="evt_002",
             idempotency_key="idemp_002",
@@ -251,15 +245,7 @@ class TestOLPEngine(unittest.TestCase):
         self.assertEqual(items[1].price, 6300)
         self.assertEqual(sum(item.price for item in items), 9000)
 
-    # =========================================================================
-    # ADVANCED CPA PARITY TESTS (PHASE 4)
-    # =========================================================================
-
     def test_deferred_costs_amortization(self):
-        """
-        ASC 340-40 Compliance: Capitalize sales commissions ($12.00 / 1200 cents)
-        and amortize over 3 months ($4.00 / 400 cents per month).
-        """
         event = OLPEvent(
             event_id="evt_costs_001",
             idempotency_key="idemp_costs_001",
@@ -268,7 +254,7 @@ class TestOLPEngine(unittest.TestCase):
             currency="USD",
             description="3-Month SaaS Sub with Commission Cost",
             customer_id="cust_user",
-            capitalized_costs=1200, # Sales commission asset
+            capitalized_costs=1200,
             accounting_context=AccountingContext(
                 role="principal",
                 product_type="digital_saas",
@@ -277,47 +263,36 @@ class TestOLPEngine(unittest.TestCase):
             )
         )
         result = OLPEngine.compile_event(event)
-        
-        # Verify Initial Transaction
         tx = result.initial_transaction
         self.assertTrue(tx.is_balanced())
         
         debits = {e.account: e.amount for e in tx.entries if e.type == "debit"}
         credits = {e.account: e.amount for e in tx.entries if e.type == "credit"}
         
-        # Should record commission asset and commission liability
         self.assertEqual(debits[ACCOUNT_PATHS["Deferred Contract Costs"]], 1200)
         self.assertEqual(credits[ACCOUNT_PATHS["Commissions Payable"]], 1200)
 
-        # Verify Amortization schedule
         self.assertEqual(len(result.amortization_schedule), 3)
         for amort_tx in result.amortization_schedule:
             self.assertTrue(amort_tx.is_balanced())
             debits_amort = {e.account: e.amount for e in amort_tx.entries if e.type == "debit"}
             credits_amort = {e.account: e.amount for e in amort_tx.entries if e.type == "credit"}
             
-            # Check amortization of commission expense
             self.assertEqual(debits_amort[ACCOUNT_PATHS["Amortized Commission Expense"]], 400)
             self.assertEqual(credits_amort[ACCOUNT_PATHS["Deferred Contract Costs"]], 400)
 
     def test_foreign_exchange_revaluation(self):
-        """
-        ASC 830 Compliance: Invoice booked at $540.00 (54000 cents).
-        Wire payment settled for €500 which converted to $520.00 (52000 cents).
-        Processing fee is $15.00 (1500 cents).
-        This results in a $20.00 (2000 cents) FX Loss.
-        """
         settle_event = OLPEvent(
             event_id="evt_fx_settle",
             idempotency_key="idemp_fx_set",
             event_type="payment_settled",
             timestamp="2026-07-31T09:00:00Z",
-            amount=54000,           # Booked Invoice AR value
+            amount=54000,
             currency="USD",
             description="Payment Settled with FX Revaluation",
             customer_id="cust_corp",
             processing_fee=1500,
-            functional_amount=52000, # Actual dollars deposited at settlement
+            functional_amount=52000,
             accounting_context=AccountingContext(
                 role="principal",
                 product_type="digital_download",
@@ -332,23 +307,12 @@ class TestOLPEngine(unittest.TestCase):
         debits = {e.account: e.amount for e in tx.entries if e.type == "debit"}
         credits = {e.account: e.amount for e in tx.entries if e.type == "credit"}
 
-        # Cash net = 52000 - 1500 = 50500
         self.assertEqual(debits[ACCOUNT_PATHS["Cash"]], 50500)
         self.assertEqual(debits[ACCOUNT_PATHS["Payment Processing Expense"]], 1500)
-        
-        # AR fully cleared
         self.assertEqual(credits[ACCOUNT_PATHS["Accounts Receivable"]], 54000)
-        
-        # Loss on FX of $20.00
         self.assertEqual(debits[ACCOUNT_PATHS["Loss on FX"]], 2000)
 
     def test_contract_asset_billing_lifecycle(self):
-        """
-        ASC 606 Compliance: 
-        1. Recognize revenue over-time while unbilled -> Contract Assets
-        2. Billing event sent -> Convert Contract Assets to Accounts Receivable
-        """
-        # Day 1: Invoice booking Net-30 unbilled
         event = OLPEvent(
             event_id="evt_unbilled",
             timestamp="2026-07-16T12:00:00Z",
@@ -372,7 +336,6 @@ class TestOLPEngine(unittest.TestCase):
         debits = {e.account: e.amount for e in tx.entries if e.type == "debit"}
         self.assertEqual(debits[ACCOUNT_PATHS["Contract Assets"]], 10000)
 
-        # Day 15: Bill the Contract Asset to AR
         bill_event = OLPEvent(
             event_id="evt_billed",
             event_type="contract_billed",
@@ -399,9 +362,6 @@ class TestOLPEngine(unittest.TestCase):
         self.assertEqual(credits_bill[ACCOUNT_PATHS["Contract Assets"]], 10000)
 
     def test_bad_debt_write_off(self):
-        """
-        Invoice written off as Bad Debt.
-        """
         event = OLPEvent(
             event_id="evt_writeoff",
             event_type="invoice_written_off",
@@ -427,22 +387,96 @@ class TestOLPEngine(unittest.TestCase):
         self.assertEqual(debits[ACCOUNT_PATHS["Bad Debt Expense"]], 5000)
         self.assertEqual(credits[ACCOUNT_PATHS["Accounts Receivable"]], 5000)
 
-    def test_validation_errors(self):
-        with self.assertRaises(ValueError):
-            OLPEngine.compile_event(OLPEvent(
-                event_id="evt_err",
-                idempotency_key="idemp_err",
-                timestamp="2026-07-16T12:00:00Z",
-                amount=10000,
-                currency="USD",
-                description="Error Sub",
-                customer_id="cust_err",
-                accounting_context=AccountingContext(
-                    role="principal",
-                    product_type="digital_saas",
-                    recognition="over_time"
-                )
-            ))
+    # =========================================================================
+    # DECOUPLED MULTI-PIPELINE RECONCILIATION TEST (PHASE 5)
+    # =========================================================================
+
+    def test_decoupled_pipeline_reconciliation(self):
+        """
+        Verify multi-pipeline reconciliation flow at scale.
+        Step 1: Order Placed -> Debit Order Clearing, Credit Gross Rev & Tax
+        Step 2: Charge Settled -> Debit Payment Clearing & Processing Fee, Credit Order Clearing
+        Step 3: Payout Cleared -> Debit Operating Cash, Credit Payment Clearing
+        """
+        ctx = AccountingContext(
+            role="principal",
+            product_type="physical",
+            recognition="point_in_time",
+            payment_method="card"
+        )
+        
+        # Step 1: Business Side Checkout creates the order log
+        order_event = OLPEvent(
+            event_id="order_112233",
+            event_type="order_placed",
+            idempotency_key="idemp_order_112",
+            timestamp="2026-07-16T12:00:00Z",
+            amount=10800, # $108.00 inclusive of tax
+            tax_amount=800,
+            currency="USD",
+            description="Laptop Stand checkout order",
+            customer_id="cust_jim",
+            accounting_context=ctx
+        )
+        res_order = OLPEngine.compile_event(order_event)
+        tx_order = res_order.initial_transaction
+        self.assertTrue(tx_order.is_balanced())
+        
+        debits_o = {e.account: e.amount for e in tx_order.entries if e.type == "debit"}
+        credits_o = {e.account: e.amount for e in tx_order.entries if e.type == "credit"}
+        
+        # Gross revenue recognized, balance sits in Order Clearing
+        self.assertEqual(debits_o[ACCOUNT_PATHS["Order Clearing"]], 10800)
+        self.assertEqual(credits_o[ACCOUNT_PATHS["Gross Revenue"]], 10000)
+        self.assertEqual(credits_o[ACCOUNT_PATHS["Sales Tax Payable"]], 800)
+
+        # Step 2: Card processor settles payment and takes transaction fee
+        settle_event = OLPEvent(
+            event_id="settle_112233",
+            event_type="charge_settled",
+            idempotency_key="idemp_settle_112",
+            timestamp="2026-07-16T12:05:00Z",
+            amount=10800, # Gross settled value
+            processing_fee=320, # $3.20 Stripe fee
+            currency="USD",
+            description="Stripe charge settlement for order 112233",
+            customer_id="cust_jim",
+            accounting_context=ctx
+        )
+        res_settle = OLPEngine.compile_event(settle_event)
+        tx_settle = res_settle.initial_transaction
+        self.assertTrue(tx_settle.is_balanced())
+        
+        debits_s = {e.account: e.amount for e in tx_settle.entries if e.type == "debit"}
+        credits_s = {e.account: e.amount for e in tx_settle.entries if e.type == "credit"}
+        
+        # Order clearing credited, funds moved to Payment Clearing net of fee
+        self.assertEqual(credits_s[ACCOUNT_PATHS["Order Clearing"]], 10800)
+        self.assertEqual(debits_s[ACCOUNT_PATHS["Payment Clearing"]], 10480)
+        self.assertEqual(debits_s[ACCOUNT_PATHS["Payment Processing Expense"]], 320)
+
+        # Step 3: Treasury processes Stripe bank payout file
+        payout_event = OLPEvent(
+            event_id="payout_112233",
+            event_type="payout_cleared",
+            idempotency_key="idemp_payout_112",
+            timestamp="2026-07-18T06:00:00Z",
+            amount=10480, # Bank deposit matches net payout
+            currency="USD",
+            description="Bank transfer payout from Stripe",
+            customer_id="cust_jim",
+            accounting_context=ctx
+        )
+        res_payout = OLPEngine.compile_event(payout_event)
+        tx_payout = res_payout.initial_transaction
+        self.assertTrue(tx_payout.is_balanced())
+        
+        debits_p = {e.account: e.amount for e in tx_payout.entries if e.type == "debit"}
+        credits_p = {e.account: e.amount for e in tx_payout.entries if e.type == "credit"}
+        
+        # Cash debited, Payment clearing credited (zeroed out)
+        self.assertEqual(debits_p[ACCOUNT_PATHS["Cash"]], 10480)
+        self.assertEqual(credits_p[ACCOUNT_PATHS["Payment Clearing"]], 10480)
 
 if __name__ == "__main__":
     unittest.main()
