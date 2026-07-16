@@ -33,9 +33,9 @@ OLP establishes a middleware compiler layer that acts like an "HTTP header parse
 
 ```mermaid
 graph TD
-    A[Billing / Checkout Engine] -->|1. Emits OLP Event + Context Header| B(OLP Compiler Engine)
-    B -->|2. Resolves COA Paths & Netting Rules| C[Balanced Double-Entry Journals]
-    C -->|3. Feeds Ledger Engine| D(General Ledger: Twisp / Fragment / Custom DB)
+    A["Billing /<br>Checkout Engine"] -->|1. Emits Event + Context| B("OLP Compiler<br>Engine")
+    B -->|2. Resolves COA & Netting| C["Balanced<br>Double-Entry Journals"]
+    C -->|3. Feeds Engine| D("General Ledger:<br>Twisp / Fragment")
 ```
 
 ### 2.1 The Accounting Context Header
